@@ -1,4 +1,7 @@
 #include "configuration.h"
+#ifdef ARCH_ESP32
+#include <Preferences.h>
+#endif
 #include "main.h"
 #include "memory/MemAudit.h"
 #if USE_TFTDISPLAY
@@ -15,6 +18,34 @@
 #include <SparkFunSX1509.h>
 #include <Wire.h>
 extern SX1509 gpioExtender;
+#endif
+
+// Default orientation for panels without an explicit case below; variants may override.
+#ifndef TFT_ROTATION
+#define TFT_ROTATION 3
+#endif
+
+#ifdef SCREEN_ROTATE_RUNTIME
+#include "NodeDB.h"
+
+// A variant opting into runtime rotation should give both panel values; fall back to the
+// usual 0/1 pair so enabling the flag alone cannot fail to build.
+#ifndef TFT_ROTATION_PORTRAIT
+#define TFT_ROTATION_PORTRAIT 0
+#endif
+#ifndef TFT_ROTATION_LANDSCAPE
+#define TFT_ROTATION_LANDSCAPE 1
+#endif
+
+// Runtime orientation (see the variant's variant.h for why flip_screen carries this).
+// The panel rotation and the UI canvas geometry are set in two different places - the
+// constructor and init() - and must agree, so both read this one function rather than
+// testing the config field twice. Safe to call from the constructor: Screen.cpp already
+// reads config.display.displaymode where TFTDisplay is built, so config is loaded by then.
+static inline bool tftRuntimeLandscape()
+{
+    return config.display.flip_screen;
+}
 #endif
 
 #if defined(ST7735S)
@@ -718,6 +749,12 @@ static LGFX *tft = nullptr;
 #define TFT_BL ILI9341_BACKLIGHT_EN
 #endif
 
+// Panels wired with the X axis reversed render mirrored at offset 0; values 4~7 mirror.
+// Default 0 preserves the previous hardcoded behaviour for existing ILI9341 variants.
+#ifndef TFT_OFFSET_ROTATION
+#define TFT_OFFSET_ROTATION 0
+#endif
+
 class LGFX : public lgfx::LGFX_Device
 {
 #if defined(ILI9341_DRIVER)
@@ -727,6 +764,9 @@ class LGFX : public lgfx::LGFX_Device
 #endif
     lgfx::Bus_SPI _bus_instance;
     lgfx::Light_PWM _light_instance;
+#if defined(USE_XPT2046)
+    lgfx::Touch_XPT2046 _touch_instance;
+#endif
 
   public:
     LGFX(void)
@@ -771,7 +811,7 @@ class LGFX : public lgfx::LGFX_Device
             cfg.panel_height = TFT_HEIGHT; // actual displayable height
             cfg.offset_x = TFT_OFFSET_X;   // Panel offset amount in X direction
             cfg.offset_y = TFT_OFFSET_Y;   // Panel offset amount in Y direction
-            cfg.offset_rotation = 0;       // Rotation direction value offset 0~7 (4~7 is upside down)
+            cfg.offset_rotation = TFT_OFFSET_ROTATION; // Rotation direction value offset 0~7 (4~7 is mirrored)
             cfg.dummy_read_pixel = 8;      // Number of bits for dummy read before pixel readout
             cfg.dummy_read_bits = 1;       // Number of bits for dummy read before non-pixel data read
             cfg.readable = true;           // Set to true if data can be read
@@ -803,6 +843,39 @@ class LGFX : public lgfx::LGFX_Device
         }
 #endif
 
+#if defined(USE_XPT2046)
+        {
+            // Configure settings for touch control. The XPT2046 shares the panel's SPI bus but
+            // cannot run at panel speed, so it gets its own (much lower) clock.
+            auto touch_cfg = _touch_instance.config();
+
+            // These live in an anonymous union with no default initialisers, so set all four.
+            // spi_host = -1 selects the driver's bit-bang path. On boards where the
+            // XPT2046 has its own pins (not the panel bus) that is both safe and simpler
+            // than sharing a hardware SPI host with the display.
+            touch_cfg.spi_host = -1;
+            touch_cfg.pin_sclk = TOUCH_SCLK;
+            touch_cfg.pin_mosi = TOUCH_MOSI;
+            touch_cfg.pin_miso = TOUCH_MISO;
+
+            touch_cfg.pin_cs = TOUCH_CS;
+            // Leave pin_int unset: the driver bails out of getTouchRaw() before any SPI
+            // read whenever this pin reads high, and GPIO34-39 have no internal pullup.
+            touch_cfg.pin_int = -1;
+            touch_cfg.freq = 2500000; // XPT2046 max; matches TFT_eSPI SPI_TOUCH_FREQUENCY
+            touch_cfg.bus_shared = false; // dedicated pins - no panel-bus arbitration needed
+
+            // Raw ADC span the controller reports at the panel edges.
+            touch_cfg.x_min = 300;
+            touch_cfg.x_max = 3900;
+            touch_cfg.y_min = 400;
+            touch_cfg.y_max = 3900;
+            touch_cfg.offset_rotation = 0;
+
+            _touch_instance.config(touch_cfg);
+            _panel_instance.setTouch(&_touch_instance);
+        }
+#endif
         setPanel(&_panel_instance);
     }
 };
@@ -1214,6 +1287,14 @@ TFTDisplay::TFTDisplay(uint8_t address, int sda, int scl, OLEDDISPLAY_GEOMETRY g
         setGeometry(GEOMETRY_RAWMODE, portduino_config.displayHeight, portduino_config.displayHeight);
     }
 
+#elif defined(SCREEN_ROTATE_RUNTIME)
+    // Canvas half of the runtime orientation; the panel half is in init(). Swapping these
+    // does not resize the framebuffer - displayWidth * maxDisplayHeight / 8 is the same
+    // either way round - so no reallocation is involved here.
+    if (tftRuntimeLandscape())
+        setGeometry(GEOMETRY_RAWMODE, TFT_HEIGHT, TFT_WIDTH);
+    else
+        setGeometry(GEOMETRY_RAWMODE, TFT_WIDTH, TFT_HEIGHT);
 #elif defined(SCREEN_ROTATE)
     setGeometry(GEOMETRY_RAWMODE, TFT_HEIGHT, TFT_WIDTH);
 #else
@@ -1651,10 +1732,79 @@ bool TFTDisplay::connect()
     tft->setRotation(2); // T-Watch S3 left-handed orientation
 #elif ARCH_PORTDUINO || defined(SENSECAP_INDICATOR) || defined(T_LORA_PAGER)
     tft->setRotation(0); // use config.yaml to set rotation
+#elif defined(SCREEN_ROTATE_RUNTIME)
+    // Panel half of the runtime orientation; the canvas half is in the constructor.
+    tft->setRotation(tftRuntimeLandscape() ? TFT_ROTATION_LANDSCAPE : TFT_ROTATION_PORTRAIT);
+    LOG_INFO("Display orientation: %s (display.flip_screen=%d)", tftRuntimeLandscape() ? "landscape" : "portrait",
+             (int)config.display.flip_screen);
 #else
-    tft->setRotation(3); // Orient horizontal and wide underneath the silkscreen name label
+    tft->setRotation(TFT_ROTATION); // Orient horizontal and wide underneath the silkscreen name label
 #endif
     tft->fillScreen(getThemeDefaultOffColor());
+
+#if defined(USE_XPT2046)
+    // hasTouch() is never called anywhere, so a panel with no touch driver bound
+    // fails silently. Say so explicitly at boot.
+    LOG_INFO("Touchscreen: %s (%dx%d)", tft->touch() ? "XPT2046 bound" : "NOT BOUND - touch is dead",
+             (int)tft->width(), (int)tft->height());
+
+
+#ifdef ARCH_ESP32
+    if (tft->touch()) {
+        // XPT2046 is resistive and needs a one-time 4-point calibration; the static
+        // x_min/x_max ranges are only approximate and mis-hit small targets like keyboard
+        // keys. Persist in NVS so this only appears on first boot. Hold the user button
+        // at boot to force recalibration.
+        constexpr size_t kCalBytes = sizeof(uint16_t) * 8;
+        uint16_t calData[8] = {0};
+        Preferences prefs;
+        bool haveCal = false;
+
+        // Calibration maps raw touch axes onto screen axes, so it is only valid for the
+        // orientation it was captured in. Keeping one key per orientation means flipping
+        // back and forth reuses whichever calibration was already done for that side
+        // instead of forcing a fresh 4-point tap every time the setting changes.
+#ifdef SCREEN_ROTATE_RUNTIME
+        const char *calKey = tftRuntimeLandscape() ? "cal_ls" : "cal_pt";
+#else
+        const char *calKey = "cal";
+#endif
+
+        if (prefs.begin("touchcal", true)) {
+            haveCal = (prefs.getBytes(calKey, calData, kCalBytes) == kCalBytes);
+            prefs.end();
+        }
+
+        bool forceRecal = false;
+#ifdef BUTTON_PIN
+        pinMode(BUTTON_PIN, INPUT_PULLUP);
+        if (digitalRead(BUTTON_PIN) == LOW) {
+            forceRecal = true;
+            LOG_INFO("Button held at boot - forcing touch recalibration");
+        }
+#endif
+        if (haveCal && !forceRecal) {
+            tft->setTouchCalibrate(calData);
+            LOG_INFO("Touch calibration restored from NVS (%s)", calKey);
+        } else {
+            LOG_INFO("Running touch calibration (%s)", calKey);
+            tft->fillScreen((uint32_t)0x000000U);
+            tft->setTextColor((uint32_t)0xFFFFFFU, (uint32_t)0x000000U);
+            tft->drawString("Touch calibration", 10, 10);
+            tft->drawString("Tap each corner marker", 10, 30);
+            delay(1500);
+            tft->calibrateTouch(calData, (uint32_t)0xFFFFFFU, (uint32_t)0x000000U, 20);
+            LOG_INFO("Touch cal captured: %u %u %u %u %u %u %u %u", calData[0], calData[1], calData[2], calData[3],
+                     calData[4], calData[5], calData[6], calData[7]);
+            if (prefs.begin("touchcal", false)) {
+                prefs.putBytes(calKey, calData, kCalBytes);
+                prefs.end();
+            }
+            tft->fillScreen(getThemeDefaultOffColor());
+        }
+    }
+#endif
+#endif
 
     if (this->linePixelBuffer == NULL) {
         this->linePixelBuffer = (uint16_t *)malloc(sizeof(uint16_t) * displayWidth);

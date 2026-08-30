@@ -2025,7 +2025,39 @@ std::unique_ptr<GPS> GPS::createGps()
 
 //  ESP32 has a special set of parameters vs other arduino ports
 #if defined(ARCH_ESP32)
+#if defined(GPS_SHARES_UART0)
+        // This board can wire the GPS to GPIO3/GPIO1, which UART0 (the USB serial console)
+        // also owns. Two UART peripherals on the same pin fight: 9600-baud GPS start bits
+        // look like a break condition to UART0 at 115200 and reset the ESP32.
+        //
+        // Decide at RUNTIME, not compile time. config.position.rx_gpio/tx_gpio are settable
+        // from the phone app and the CLI and OVERRIDE GPS_RX_PIN/GPS_TX_PIN (see
+        // createGps() above), so the same firmware may or may not land on a UART0 pin.
+        // Only split the UARTs when we actually collide - otherwise we would surrender the
+        // serial console for nothing.
+        constexpr int8_t kUart0RxPin = 3; // ESP32 UART0 RX (USB serial console)
+        constexpr int8_t kUart0TxPin = 1; // ESP32 UART0 TX
+        if (new_gps->rx_gpio == kUart0RxPin || new_gps->tx_gpio == kUart0TxPin) {
+            // Each UART gives up the pin the other needs:
+            //   UART0 keeps TX on GPIO1 so debug logging still works, RX detached (-1)
+            //   GPS keeps its RX pin for NMEA, TX detached (-1) so it cannot displace UART0_TX
+            // Cost while split: we cannot transmit to the receiver, so no autobaud and no
+            // runtime reconfiguration - it must already emit NMEA at GPS_BAUDRATE.
+            Serial.begin(115200, SERIAL_8N1, -1, kUart0TxPin);
+            LOG_INFO("GPS on GPIO%d collides with UART0: detached UART0 RX, GPS is RX-only. "
+                     "Serial log still works but the serial CLI will not",
+                     new_gps->rx_gpio);
+            _serial_gps->begin(GPS_BAUDRATE, SERIAL_8N1, new_gps->rx_gpio, -1);
+        } else {
+            // tx_gpio == 0 means "unset", not "GPIO0" - and GPIO0 is the boot button on
+            // this board, so hand the UART -1 rather than letting it drive that pin.
+            const int8_t txPin = new_gps->tx_gpio > 0 ? new_gps->tx_gpio : -1;
+            LOG_INFO("GPS on GPIO%d clear of UART0; serial console left intact", new_gps->rx_gpio);
+            _serial_gps->begin(GPS_BAUDRATE, SERIAL_8N1, new_gps->rx_gpio, txPin);
+        }
+#else
         _serial_gps->begin(GPS_BAUDRATE, SERIAL_8N1, new_gps->rx_gpio, new_gps->tx_gpio);
+#endif
 #elif defined(ARCH_RP2040)
         _serial_gps->setPinout(new_gps->tx_gpio, new_gps->rx_gpio);
         _serial_gps->setFIFOSize(256);

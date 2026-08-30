@@ -35,7 +35,12 @@ using namespace STM32_LittleFS_Namespace;
 // ESP32 version
 #include "LittleFS.h"
 #define FSCom LittleFS
-#define FSBegin() FSCom.begin(true) // format on failure
+// maxOpenFiles defaults to 10, which the phone-API file manifest can exhaust: it
+// walks 3 directories deep and each recursive open holds a descriptor, on top of
+// the config/message-store files already open. That surfaces as
+// "esp_littlefs: Unable to allocate FD" and an empty manifest. Each descriptor is
+// only a small struct, so 20 is cheap insurance.
+#define FSBegin() FSCom.begin(true, "/littlefs", 20) // format on failure
 #define FILE_O_WRITE "w"
 #define FILE_O_READ "r"
 #endif
