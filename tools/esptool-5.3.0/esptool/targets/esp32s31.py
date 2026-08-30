@@ -1,0 +1,254 @@
+# SPDX-FileCopyrightText: 2025-2026 Fredrik Ahlberg, Angus Gratton,
+# Espressif Systems (Shanghai) CO LTD, other contributors as noted.
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+import struct
+
+from ..loader import ESPLoader, StubMixin
+from ..logger import log
+from ..util import FatalError, NotImplementedInROMError
+from .esp32c5 import ESP32C5ROM
+
+
+class ESP32S31ROM(ESP32C5ROM):
+    CHIP_NAME = "ESP32-S31"
+    IMAGE_CHIP_ID = 32
+
+    IROM_MAP_START = 0x40000000
+    IROM_MAP_END = 0x54000000
+    DROM_MAP_START = 0x40000000
+    DROM_MAP_END = 0x54000000
+
+    BOOTLOADER_FLASH_OFFSET = 0x2000  # First 2 sectors are reserved for FE purposes
+
+    UART_DATE_REG_ADDR = 0x2038A000 + 0x8C
+
+    EFUSE_BASE = 0x20715000
+    EFUSE_BLOCK1_ADDR = EFUSE_BASE + 0x050
+    MAC_EFUSE_REG = EFUSE_BASE + 0x050
+
+    SPI_REG_BASE = 0x20501000
+    SPI_USR_OFFS = 0x18
+    SPI_USR1_OFFS = 0x1C
+    SPI_USR2_OFFS = 0x20
+    SPI_MOSI_DLEN_OFFS = 0x24
+    SPI_MISO_DLEN_OFFS = 0x28
+    SPI_W0_OFFS = 0x58
+
+    SPI_ADDR_REG_MSB = False
+
+    DR_REG_LP_WDT_BASE = 0x20801000
+    RTC_CNTL_WDTCONFIG0_REG = DR_REG_LP_WDT_BASE + 0x0
+    RTC_CNTL_WDTCONFIG1_REG = DR_REG_LP_WDT_BASE + 0x4
+    RTC_CNTL_WDTWPROTECT_REG = DR_REG_LP_WDT_BASE + 0x18
+    RTC_CNTL_WDT_WKEY = 0x50D83AA1
+
+    EFUSE_RD_REG_BASE = EFUSE_BASE + 0x030  # EFUSE_RD_REPEAT_DATA0_REG
+
+    # KEY_PURPOSE_0..4 live in EFUSE_RD_REPEAT_DATA2_REG
+    EFUSE_PURPOSE_KEY0_REG = EFUSE_BASE + 0x38
+    EFUSE_PURPOSE_KEY0_SHIFT = 0
+    EFUSE_PURPOSE_KEY1_REG = EFUSE_BASE + 0x38
+    EFUSE_PURPOSE_KEY1_SHIFT = 5
+    EFUSE_PURPOSE_KEY2_REG = EFUSE_BASE + 0x38
+    EFUSE_PURPOSE_KEY2_SHIFT = 10
+    EFUSE_PURPOSE_KEY3_REG = EFUSE_BASE + 0x38
+    EFUSE_PURPOSE_KEY3_SHIFT = 15
+    EFUSE_PURPOSE_KEY4_REG = EFUSE_BASE + 0x38
+    EFUSE_PURPOSE_KEY4_SHIFT = 20
+
+    EFUSE_DIS_DOWNLOAD_MANUAL_ENCRYPT_REG = EFUSE_RD_REG_BASE
+    EFUSE_DIS_DOWNLOAD_MANUAL_ENCRYPT = 1 << 20
+
+    EFUSE_SPI_BOOT_CRYPT_CNT_REG = EFUSE_BASE + 0x034
+    EFUSE_SPI_BOOT_CRYPT_CNT_MASK = 0x7 << 21
+
+    EFUSE_SECURE_BOOT_EN_REG = EFUSE_BASE + 0x03C
+    EFUSE_SECURE_BOOT_EN_MASK = 1 << 2
+
+    EFUSE_FORCE_USE_KEY_MANAGER_KEY_REG = EFUSE_BASE + 0x034
+    EFUSE_FORCE_USE_KEY_MANAGER_KEY_SHIFT = 12
+    FORCE_USE_KEY_MANAGER_VAL_XTS_AES_KEY = 2
+
+    PURPOSE_VAL_XTS_AES256_KEY_1 = 2
+    PURPOSE_VAL_XTS_AES256_KEY_2 = 3
+    PURPOSE_VAL_XTS_AES128_KEY = 4
+
+    FLASH_ENCRYPTED_WRITE_ALIGN = 16
+
+    MEMORY_MAP = [
+        [0x00000000, 0x00010000, "PADDING"],
+        [0x40000000, 0x54000000, "DROM"],
+        [0x2F000000, 0x2F080000, "DRAM"],
+        [0x2F000000, 0x2F080000, "BYTE_ACCESSIBLE"],
+        [0x2F800000, 0x2F850000, "DROM_MASK"],
+        [0x2F800000, 0x2F850000, "IROM_MASK"],
+        [0x40000000, 0x54000000, "IROM"],
+        [0x2F000000, 0x2F080000, "IRAM"],
+        [0x2E000000, 0x2E008000, "RTC_IRAM"],
+        [0x2E000000, 0x2E008000, "RTC_DRAM"],
+    ]
+
+    UF2_FAMILY_ID = 0x3101F7C1
+
+    USB_RAM_BLOCK = 0x800  # Max block size USB-OTG is used
+
+    EFUSE_MAX_KEY = 4
+    KEY_PURPOSES: dict[int, str] = {
+        0: "USER/EMPTY",
+        1: "ECDSA_KEY",  # ECDSA_KEY_P256 (NIST P-256)
+        2: "XTS_AES_256_KEY_1",
+        3: "XTS_AES_256_KEY_2",
+        4: "XTS_AES_128_KEY",
+        5: "HMAC_DOWN_ALL",
+        6: "HMAC_DOWN_JTAG",
+        7: "HMAC_DOWN_DIGITAL_SIGNATURE",
+        8: "HMAC_UP",
+        9: "SECURE_BOOT_DIGEST0",
+        10: "SECURE_BOOT_DIGEST1",
+        11: "SECURE_BOOT_DIGEST2",
+        12: "KM_INIT_KEY",
+        13: "XTS_AES_256_PSRAM_KEY_1",
+        14: "XTS_AES_256_PSRAM_KEY_2",
+        15: "XTS_AES_128_PSRAM_KEY",
+        16: "ECDSA_KEY_P192",
+        17: "ECDSA_KEY_P384_L",
+        18: "ECDSA_KEY_P384_H",
+        19: "SDC_KEY_DIGEST",
+    }
+
+    def get_pkg_version(self):
+        num_word = 4  # EFUSE_RD_MAC_SYS4_REG
+        return (self.read_reg(self.EFUSE_BLOCK1_ADDR + (4 * num_word)) >> 6) & 0x03
+
+    def get_minor_chip_version(self):
+        num_word = 3  # EFUSE_RD_MAC_SYS3_REG
+        return (self.read_reg(self.EFUSE_BLOCK1_ADDR + (4 * num_word)) >> 18) & 0x0F
+
+    def get_major_chip_version(self):
+        num_word = 3  # EFUSE_RD_MAC_SYS3_REG
+        return (self.read_reg(self.EFUSE_BLOCK1_ADDR + (4 * num_word)) >> 22) & 0x03
+
+    def get_chip_description(self):
+        chip_name = {
+            0: "ESP32-S31",
+        }.get(self.get_pkg_version(), "unknown ESP32-S31")
+        major_rev = self.get_major_chip_version()
+        minor_rev = self.get_minor_chip_version()
+        return f"{chip_name} (revision v{major_rev}.{minor_rev})"
+
+    def get_chip_features(self):
+        return [
+            "Wi-Fi 6",
+            "BT 5.4 (LE)",
+            "IEEE802.15.4",
+            "Dual Core + LP Core",
+            "300MHz",
+        ]
+
+    def get_crystal_freq(self):
+        # ESP32-S31 XTAL is fixed to 40MHz
+        return 40
+
+    def get_flash_voltage(self):
+        pass  # not supported on ESP32-S31
+
+    def override_vddsdio(self, new_voltage):
+        raise NotImplementedInROMError(
+            "VDD_SDIO overrides are not supported for ESP32-S31"
+        )
+
+    def read_mac(self, mac_type="BASE_MAC"):
+        """Read MAC from EFUSE region"""
+        if mac_type != "BASE_MAC":
+            return None
+        mac0 = self.read_reg(self.MAC_EFUSE_REG)
+        mac1 = self.read_reg(self.MAC_EFUSE_REG + 4)  # only bottom 16 bits are MAC
+        bitstring = struct.pack(">II", mac1, mac0)[2:]
+        return tuple(bitstring)
+
+    def get_flash_crypt_config(self):
+        return None  # doesn't exist on ESP32-S31
+
+    def get_secure_boot_enabled(self):
+        return (
+            self.read_reg(self.EFUSE_SECURE_BOOT_EN_REG)
+            & self.EFUSE_SECURE_BOOT_EN_MASK
+        )
+
+    def get_key_block_purpose(self, key_block):
+        if key_block < 0 or key_block > self.EFUSE_MAX_KEY:
+            raise FatalError(
+                f"Valid key block numbers must be in range 0-{self.EFUSE_MAX_KEY}"
+            )
+
+        reg, shift = [
+            (self.EFUSE_PURPOSE_KEY0_REG, self.EFUSE_PURPOSE_KEY0_SHIFT),
+            (self.EFUSE_PURPOSE_KEY1_REG, self.EFUSE_PURPOSE_KEY1_SHIFT),
+            (self.EFUSE_PURPOSE_KEY2_REG, self.EFUSE_PURPOSE_KEY2_SHIFT),
+            (self.EFUSE_PURPOSE_KEY3_REG, self.EFUSE_PURPOSE_KEY3_SHIFT),
+            (self.EFUSE_PURPOSE_KEY4_REG, self.EFUSE_PURPOSE_KEY4_SHIFT),
+        ][key_block]
+        return (self.read_reg(reg) >> shift) & 0x1F
+
+    def uses_key_manager_for_flash_encryption(self):
+        return bool(
+            (
+                self.read_reg(self.EFUSE_FORCE_USE_KEY_MANAGER_KEY_REG)
+                >> self.EFUSE_FORCE_USE_KEY_MANAGER_KEY_SHIFT
+            )
+            & self.FORCE_USE_KEY_MANAGER_VAL_XTS_AES_KEY
+        )
+
+    def is_flash_encryption_key_valid(self):
+        # Need to see either an AES-128 key or two AES-256 keys
+        purposes = [
+            self.get_key_block_purpose(b) for b in range(self.EFUSE_MAX_KEY + 1)
+        ]
+
+        if any(p == self.PURPOSE_VAL_XTS_AES128_KEY for p in purposes):
+            return True
+
+        if any(p == self.PURPOSE_VAL_XTS_AES256_KEY_1 for p in purposes) and any(
+            p == self.PURPOSE_VAL_XTS_AES256_KEY_2 for p in purposes
+        ):
+            return True
+
+        return self.uses_key_manager_for_flash_encryption()
+
+    def change_baud(self, baud):
+        ESPLoader.change_baud(self, baud)
+
+    def _post_connect(self):
+        if self.uses_usb_otg():
+            self.ESP_RAM_BLOCK = self.USB_RAM_BLOCK
+
+    def check_spi_connection(self, spi_connection):
+        if not set(spi_connection).issubset(set(range(0, 61))):
+            raise FatalError("SPI Pin numbers must be in the range 0-60.")
+        if any([v for v in spi_connection if v in [33, 34]]):
+            log.warning(
+                "GPIO pins 33 and 34 are used by USB-Serial/JTAG, "
+                "consider using other pins for SPI flash connection."
+            )
+
+    def hard_reset(self):
+        (
+            self.watchdog_reset()
+            if (not self.secure_download_mode and self.uses_usb_otg())
+            else ESPLoader.hard_reset(self)
+        )
+
+
+class ESP32S31StubLoader(StubMixin, ESP32S31ROM):
+    """Stub loader for ESP32-S31, runs on top of ROM."""
+
+    def __init__(self, rom_loader):
+        super().__init__(rom_loader)  # Initialize the mixin
+        if rom_loader.uses_usb_otg():
+            self.ESP_RAM_BLOCK = self.USB_RAM_BLOCK
+            self.FLASH_WRITE_SIZE = self.USB_RAM_BLOCK
+
+
+ESP32S31ROM.STUB_CLASS = ESP32S31StubLoader
