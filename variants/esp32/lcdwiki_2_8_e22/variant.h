@@ -1,6 +1,14 @@
-// LCDWIKI 2.8" ESP32-32E display with an Ebyte E22-900M22S LoRa module (US 915 MHz).
-// The E22-900M22S is the bare-SX1262 SPI part (the "M" suffix); the "T" parts are
-// UART modules with an onboard MCU and cannot be driven by SX1262Interface.
+// LCDWIKI 2.8" ESP32-32E display with a Seeed Wio-SX1262 LoRa module (US 915 MHz).
+// Wideband 862-930 MHz, +22 dBm, TCXO on DIO3, IPEX/u.FL antenna.
+//
+// Originally built against an Ebyte E22-900M22S and the radio config is unchanged
+// between the two - both are a bare SX1262 with no external PA, switching TX through
+// the chip's own DIO2 and RX through one MCU pin. Only the pad naming differs: the
+// E22 calls that pad RXEN, the Wio-SX1262 silkscreens it RF_SW.
+//
+// If swapping back to an Ebyte part, note the suffix: "M" is the bare-SX1262 SPI part
+// this config expects; the "T" parts are UART modules with an onboard MCU and cannot
+// be driven by SX1262Interface at all.
 //
 // Display: ILI9341 on HSPI (12/13/14)
 // Touch:   XPT2046 on the same HSPI bus, separate CS
@@ -64,15 +72,11 @@
 #define SPI_FREQUENCY 40000000
 #define SPI_READ_FREQUENCY 16000000
 
-// Orientation. Set LCDWIKI_PORTRAIT to 1 for portrait, 0 for landscape.
-// The two knobs the ILI9341 path actually reads:
+// Orientation. The two knobs the ILI9341 path actually reads:
 //   TFT_OFFSET_ROTATION - panel-level offset 0~7; 4~7 mirror the X axis.
 //   TFT_ROTATION        - LovyanGFX setRotation() value 0~3 (90 degree steps).
-// TFT_WIDTH/HEIGHT above are the panel's NATIVE portrait size, and SCREEN_ROTATE
-// makes TFTDisplay build the UI canvas as (TFT_HEIGHT x TFT_WIDTH). So landscape
-// needs BOTH the panel rotated and the canvas swapped; portrait needs neither.
-// Touch calibration is orientation-specific: after changing this, hold the user
-// button at boot to re-run the 4-point calibration.
+// TFT_WIDTH/HEIGHT above are the panel's NATIVE portrait size.
+//
 // Orientation is a RUNTIME setting on this board: config.display.flip_screen selects
 // landscape, so it can be changed from the phone app or the CLI with no reflash:
 //   meshtastic --port COMx --set display.flip_screen true
@@ -130,7 +134,7 @@
 // surfacing as critical error 3 (NO_RADIO) no matter how it is wired.
 #define USE_SX1262
 
-// LoRa SX1262 (E22-900M22S) - VSPI, shared with the SD card slot
+// LoRa SX1262 (Seeed Wio-SX1262) - VSPI, shared with the SD card slot
 #define LORA_SCK 18
 #define LORA_MISO 19
 #define LORA_MOSI 23
@@ -146,20 +150,30 @@
 // command (Module.cpp:357, :394). Wired to GPIO34, which is input-only; fine here
 // since the ESP32 only ever reads it.
 #define SX126X_BUSY 34
-// E22-900M30S drives its PA/LNA through an external RF switch, and runs its
-// TCXO from DIO3. Without these the radio mis-switches or fails to init.
-// RF switch, "Option 2" per variants/esp32s3/EBYTE_ESP32-S3/variant.h (same module):
-// wire the E22's TXEN pad to its own DIO2 pad and let the SX1262 drive it, so only
-// RXEN costs an MCU pin. DIO2 must NOT go to a GPIO - it is an output only.
-#define SX126X_DIO2_AS_RF_SWITCH
-#define SX126X_TXEN RADIOLIB_NC
-// RXEN moved off GPIO26 because 26 sits immediately next to TOUCH_SCLK (25) and is
+// Antenna switch, split across the two sides exactly as the E22 was:
+//
+// TX side: DIO2_AS_RF_SWITCH is a CHIP setting, not a pin. It goes over SPI as
+// setDio2AsRfSwitch() (SX126xInterface.cpp:134) and tells the SX1262 to drive the
+// switch from its own DIO2, which is internal to the module - no DIO2 pad is brought
+// out and none needs wiring. TXEN therefore costs no MCU pin.
+//
+// RX side: the Wio-SX1262 labels this pad RF_SW on the underside rather than RXEN,
+// but it is the same signal and it does need an MCU pin. Seeed's own board agrees -
+// variants/esp32s3/seeed_xiao_s3/variant.h ties that pad to a GPIO and declares it
+// as SX126X_RXEN alongside DIO2_AS_RF_SWITCH. Leaving it undefined would default it
+// to RADIOLIB_NC and the receive path would never be switched in.
+//
+// GPIO4 was chosen over GPIO26: 26 sits immediately next to TOUCH_SCLK (25) and is
 // held asserted throughout continuous RX. GPIO4 is the RGB LED red channel - far from
 // the touch pins - so red now tracks receive state, which is harmless.
-#define SX126X_RXEN 4
+//
+// TCXO runs from DIO3 inside the module; the voltage is likewise a chip setting.
+#define SX126X_DIO2_AS_RF_SWITCH
+#define SX126X_TXEN RADIOLIB_NC
+#define SX126X_RXEN 4 // module pad is silkscreened RF_SW
 #define SX126X_DIO3_TCXO_VOLTAGE 1.8
 
-// The E22-900M22S is a raw SX1262 with NO external PA, so it needs no TX_GAIN_LORA
+// The Wio-SX1262 is a raw SX1262 with NO external PA, so it needs no TX_GAIN_LORA
 // compensation. Do NOT define EBYTE_E22_900M30S here: that sets TX_GAIN_LORA 7 for a
 // PA this module does not have, which would under-drive transmit by ~7dB.
 // 22 is also the SX126X_MAX_POWER default; stated explicitly for clarity.
