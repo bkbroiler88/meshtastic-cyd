@@ -32,6 +32,7 @@ class menuHandler
         BuzzerModeMenuPicker,
         MuiPicker,
         BrightnessPicker,
+        OrientationPicker,
         RebootMenu,
         ShutdownMenu,
         NodePickerMenu,
@@ -102,6 +103,9 @@ class menuHandler
     static void nodeListMenu();
     static void resetNodeDBMenu();
     static void BrightnessPickerMenu();
+#ifdef SCREEN_ROTATE_RUNTIME
+    static void orientationPickerMenu();
+#endif
     static void rebootMenu();
     static void shutdownMenu();
     static void NodePicker();

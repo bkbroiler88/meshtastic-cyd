@@ -2537,9 +2537,9 @@ void menuHandler::screenOptionsMenu()
     bool hasSupportBrightness = false;
 #endif
 
-    enum optionsNumbers { Back, Brightness, FrameToggles, DisplayUnits, MessageBubbles, Theme };
-    static const char *optionsArray[7] = {"Back"};
-    static int optionsEnumArray[7] = {Back};
+    enum optionsNumbers { Back, Brightness, FrameToggles, DisplayUnits, MessageBubbles, Theme, InvertColors, Orientation };
+    static const char *optionsArray[9] = {"Back"};
+    static int optionsEnumArray[9] = {Back};
     int options = 1;
 
     // Only show brightness for B&W displays
@@ -2560,6 +2560,17 @@ void menuHandler::screenOptionsMenu()
 #if GRAPHICS_TFT_COLORING_ENABLED
     optionsArray[options] = "Theme";
     optionsEnumArray[options++] = Theme;
+#endif
+
+    // Applies immediately - SharedUIDisplay picks the palette from displaymode per draw.
+    optionsArray[options] = (config.display.displaymode == meshtastic_Config_DisplayConfig_DisplayMode_INVERTED)
+                                ? "Invert Colors: On"
+                                : "Invert Colors: Off";
+    optionsEnumArray[options++] = InvertColors;
+
+#ifdef SCREEN_ROTATE_RUNTIME
+    optionsArray[options] = config.display.flip_screen ? "Orientation: Landscape" : "Orientation: Portrait";
+    optionsEnumArray[options++] = Orientation;
 #endif
 
     BannerOverlayOptions bannerOptions;
@@ -2583,6 +2594,19 @@ void menuHandler::screenOptionsMenu()
         } else if (selected == Theme) {
             menuHandler::menuQueue = menuHandler::ThemeMenu;
             screen->runNow();
+        } else if (selected == InvertColors) {
+            config.display.displaymode = (config.display.displaymode == meshtastic_Config_DisplayConfig_DisplayMode_INVERTED)
+                                             ? meshtastic_Config_DisplayConfig_DisplayMode_DEFAULT
+                                             : meshtastic_Config_DisplayConfig_DisplayMode_INVERTED;
+            service->reloadConfig(SEGMENT_CONFIG);
+            // Reopen so the label reflects the new state.
+            menuHandler::menuQueue = menuHandler::ScreenOptionsMenu;
+            screen->runNow();
+#ifdef SCREEN_ROTATE_RUNTIME
+        } else if (selected == Orientation) {
+            menuHandler::menuQueue = menuHandler::OrientationPicker;
+            screen->runNow();
+#endif
         } else {
             menuQueue = SystemBaseMenu;
             screen->runNow();
@@ -2590,6 +2614,43 @@ void menuHandler::screenOptionsMenu()
     };
     screen->showOverlayBanner(bannerOptions);
 }
+
+#ifdef SCREEN_ROTATE_RUNTIME
+void menuHandler::orientationPickerMenu()
+{
+    static const char *optionsArray[] = {"Back", "Portrait", "Landscape"};
+
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "Orientation";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 3;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected == 0) {
+            menuHandler::menuQueue = menuHandler::ScreenOptionsMenu;
+            screen->runNow();
+            return;
+        }
+
+        const bool wantLandscape = (selected == 2);
+        if (wantLandscape == (bool)config.display.flip_screen) {
+            menuHandler::menuQueue = menuHandler::ScreenOptionsMenu; // no change
+            screen->runNow();
+            return;
+        }
+
+        config.display.flip_screen = wantLandscape;
+        service->reloadConfig(SEGMENT_CONFIG);
+
+        // A reboot is required either way: TFTDisplay sizes linePixelBuffer and
+        // repaintChunkBuffer from displayWidth in init(), so the canvas width cannot
+        // change underneath a running UI. Touch calibration is stored per orientation
+        // (cal_pt / cal_ls), so the first switch to a given side runs the 4-point tap
+        // automatically and later switches reuse it.
+        rebootAtMsec = (millis() + DEFAULT_REBOOT_SECONDS * 1000);
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+#endif
 
 void menuHandler::powerMenu()
 {
@@ -3036,6 +3097,11 @@ void menuHandler::handleMenuSwitch(OLEDDisplay *display)
     case BrightnessPicker:
         BrightnessPickerMenu();
         break;
+#ifdef SCREEN_ROTATE_RUNTIME
+    case OrientationPicker:
+        orientationPickerMenu();
+        break;
+#endif
     case NodeNameLengthMenu:
         nodeNameLengthMenu();
         break;
