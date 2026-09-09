@@ -1,16 +1,20 @@
-// LCDWIKI 2.8" ESP32-32E display with a Seeed Wio-SX1262 LoRa module (US 915 MHz).
-// Wideband 862-930 MHz, +22 dBm, TCXO on DIO3, IPEX/u.FL antenna.
+// LCDWIKI 2.8" ESP32-32E display with an Ebyte E22-900M30S LoRa module (US 915 MHz).
+// SX1262 behind a 10 dB external PA, 30 dBm rated output, TCXO on DIO3.
 //
-// Originally built against an Ebyte E22-900M22S and the radio config is unchanged
-// between the two - both are a bare SX1262 with no external PA, switching TX through
-// the chip's own DIO2 and RX through one MCU pin. Only the pad naming differs: the
-// E22 calls that pad RXEN, the Wio-SX1262 silkscreens it RF_SW.
+// The PA is the one thing that makes this module's config differ from the bare-SX1262
+// parts this board has also carried (E22-900M22S, Seeed Wio-SX1262): it needs
+// -DEBYTE_E22_900M30S so Meshtastic accounts for the extra gain. Pin map and RF-switch
+// wiring are identical across all three; only the TX power path changes. See the
+// SX126X_MAX_POWER note below before swapping modules again.
 //
-// If swapping back to an Ebyte part, note the suffix: "M" is the bare-SX1262 SPI part
-// this config expects; the "T" parts are UART modules with an onboard MCU and cannot
-// be driven by SX1262Interface at all.
+// Note the Ebyte suffix: "M" is the bare-SX1262 SPI part this config expects. The "T"
+// parts are UART modules with an onboard MCU and cannot be driven by SX1262Interface.
 //
-// Display: ILI9341 on HSPI (12/13/14)
+// A 1 W PA draws far more on TX than the 22 dBm parts. If the supply sags mid-transmit
+// the symptom is an SX126x SPI assert at SX126xInterface.cpp:331 (-705 timeout / -707
+// command failed), which looks identical to a bad solder joint.
+//
+// Display: ILI9341 or ST7789 on HSPI (12/13/14) - selected below
 // Touch:   XPT2046 on the same HSPI bus, separate CS
 // LoRa:    SX1262 on VSPI (18/19/23), separate CS
 //
@@ -45,12 +49,10 @@
 #define GPS_SHARES_UART0
 #define GPS_BAUDRATE 9600
 
-// Display (ILI9341) - HSPI bus
+// Display - HSPI bus. Panel CONTROLLER is selected below; see the note there.
 #define HAS_SPI_TFT 1
-#define ILI9341_DRIVER
 #define USE_TFTDISPLAY 1
-#define ILI9341_SPI_HOST HSPI_HOST
-// ILI9341 is natively 240x320 (portrait). These feed both panel_width/height AND
+// Natively 240x320 (portrait). These feed both panel_width/height AND
 // memory_width/height, so they must be the NATIVE values - claiming 320 columns on
 // a 240-column controller truncates the right edge. TFT_ROTATION turns it landscape.
 // (m5stack_core uses 320/240 because M5Stack Core is really an ILI9342, which IS
@@ -71,6 +73,39 @@
 
 #define SPI_FREQUENCY 40000000
 #define SPI_READ_FREQUENCY 16000000
+
+// PANEL CONTROLLER. Boards sold as "LCDWIKI 2.8 / ESP32-2432S028R" ship with either an
+// ILI9341 or an ST7789 - identical pinout, identical XPT2046 touch, different command
+// set. Check the marking on the panel or the box; they are not interchangeable.
+//
+// Getting this wrong is quiet and misleading. The backlight lights, the boot log is
+// clean ("Do TFT init", "Touchscreen: XPT2046 bound"), and touch works normally - the
+// panel has no way to report that it received the wrong command stream. What you see is
+// mirrored text, the wrong orientation, and half the frame misplaced, because MADCTL and
+// the column/page address windows land on registers that mean something else.
+//
+// Select the ST7789 board with -DLCDWIKI_PANEL_ST7789=1 (see platformio.ini); the
+// default is the ILI9341.
+#ifndef LCDWIKI_PANEL_ST7789
+#define LCDWIKI_PANEL_ST7789 0
+#endif
+
+#if LCDWIKI_PANEL_ST7789
+// TFTDisplay.cpp selects this block on ST7789_CS and reads the pins through these names.
+// Geometry still comes from the TFT_* macros above (the hardcoded 240x240 case there is
+// gated on T_WATCH_S3, which this board is not).
+#define ST7789_SPI_HOST HSPI_HOST
+#define ST7789_SCK TFT_SCLK
+#define ST7789_SDA TFT_MOSI
+#define ST7789_MISO TFT_MISO
+#define ST7789_RS TFT_DC
+#define ST7789_CS TFT_CS
+#define ST7789_RESET TFT_RST
+#define ST7789_BUSY TFT_BUSY
+#else
+#define ILI9341_DRIVER
+#define ILI9341_SPI_HOST HSPI_HOST
+#endif
 
 // Orientation. The two knobs the ILI9341 path actually reads:
 //   TFT_OFFSET_ROTATION - panel-level offset 0~7; 4~7 mirror the X axis.
@@ -106,7 +141,7 @@
 #endif
 
 // Touch controller (XPT2046) - shares the HSPI bus with the LCD.
-// Consumed by the ILI9341 LGFX block in TFTDisplay.cpp. Touch is polled;
+// Consumed by both the ILI9341 and ST7789 LGFX blocks in TFTDisplay.cpp. Touch is polled;
 // wake-on-touch would additionally need SCREEN_TOUCH_INT + ENABLE_TOUCH_INT
 // (TOUCH_IRQ / TOUCH_INT_PIN are not read by this code path at all).
 #define HAS_TOUCHSCREEN 1
@@ -134,7 +169,7 @@
 // surfacing as critical error 3 (NO_RADIO) no matter how it is wired.
 #define USE_SX1262
 
-// LoRa SX1262 (Seeed Wio-SX1262) - VSPI, shared with the SD card slot
+// LoRa SX1262 (Ebyte E22-900M30S) - VSPI, shared with the SD card slot
 #define LORA_SCK 18
 #define LORA_MISO 19
 #define LORA_MOSI 23
@@ -150,18 +185,21 @@
 // command (Module.cpp:357, :394). Wired to GPIO34, which is input-only; fine here
 // since the ESP32 only ever reads it.
 #define SX126X_BUSY 34
-// Antenna switch, split across the two sides exactly as the E22 was:
+// Antenna switch, split across two sides:
 //
 // TX side: DIO2_AS_RF_SWITCH is a CHIP setting, not a pin. It goes over SPI as
 // setDio2AsRfSwitch() (SX126xInterface.cpp:134) and tells the SX1262 to drive the
 // switch from its own DIO2, which is internal to the module - no DIO2 pad is brought
 // out and none needs wiring. TXEN therefore costs no MCU pin.
 //
-// RX side: the Wio-SX1262 labels this pad RF_SW on the underside rather than RXEN,
-// but it is the same signal and it does need an MCU pin. Seeed's own board agrees -
-// variants/esp32s3/seeed_xiao_s3/variant.h ties that pad to a GPIO and declares it
-// as SX126X_RXEN alongside DIO2_AS_RF_SWITCH. Leaving it undefined would default it
-// to RADIOLIB_NC and the receive path would never be switched in.
+// This is "Option 2" of the four arrangements laid out in
+// variants/esp32s3/EBYTE_ESP32-S3/variant.h (the reference board for this module):
+// the E22's TXEN pad is jumpered to its own DIO2 pad so the SX1262 drives it, and
+// only RXEN costs an MCU pin. That solder jumper is REQUIRED - without it TX never
+// switches through the PA.
+//
+// RX side: RXEN does need an MCU pin. Leaving it undefined would default it to
+// RADIOLIB_NC and the receive path would never be switched in.
 //
 // GPIO4 was chosen over GPIO26: 26 sits immediately next to TOUCH_SCLK (25) and is
 // held asserted throughout continuous RX. GPIO4 is the RGB LED red channel - far from
@@ -170,20 +208,30 @@
 // TCXO runs from DIO3 inside the module; the voltage is likewise a chip setting.
 #define SX126X_DIO2_AS_RF_SWITCH
 #define SX126X_TXEN RADIOLIB_NC
-#define SX126X_RXEN 4 // module pad is silkscreened RF_SW
+#define SX126X_RXEN 4
 #define SX126X_DIO3_TCXO_VOLTAGE 1.8
 
-// The Wio-SX1262 is a raw SX1262 with NO external PA, so it needs no TX_GAIN_LORA
-// compensation. Do NOT define EBYTE_E22_900M30S here: that sets TX_GAIN_LORA 7 for a
-// PA this module does not have, which would under-drive transmit by ~7dB.
-// 22 is also the SX126X_MAX_POWER default; stated explicitly for clarity.
-#define SX126X_MAX_POWER 22
+// TX power is NOT set here. The E22-900M30S has a 10 dB external PA and a 30 dBm
+// rated output, so platformio.ini defines EBYTE_E22_900M30S and configuration.h:138
+// supplies both TX_GAIN_LORA 7 and SX126X_MAX_POWER 22 for it. RadioInterface.cpp:1446
+// subtracts that gain from the requested power before driving the chip, so what leaves
+// the antenna matches what the node reports. Defining SX126X_MAX_POWER here as well
+// would just duplicate it.
+//
+// If this board is ever fitted with a bare SX1262 again (E22-900M22S, Wio-SX1262),
+// drop -DEBYTE_E22_900M30S: those have no PA, and a 7 dB subtraction would under-drive
+// transmit by that much.
 
-// This board has NO PSRAM and only ~90KB free heap after boot (of 229KB total).
+// This board has NO PSRAM and only ~94KB free heap after init (of 229KB total).
 // NimBLE plus the phone config exchange pushes it over: esp_littlefs reports
-// "dir struct could not be malloced" / "Unable to allocate FD" and the node can die
-// on connect. MAX_NUM_NODES defaults to 120 on generic ESP32 and costs ~12KB of
-// nodedb; 60 halves that and returns roughly 6KB to the heap.
+// "dir struct could not be malloced" / "Unable to allocate FD" and the node aborts on
+// connect. Observed with 60: "Client wants config" -> two "Unable to allocate FD" ->
+// abort() on core 1 -> reboot, repeatably, once per phone connection.
+//
+// MAX_NUM_NODES defaults to 120 on generic ESP32 and costs ~12KB of nodedb, so each
+// entry runs about 100 bytes. 120 -> 60 returned roughly 6KB; 60 -> 40 returns about
+// 2KB more. The trade is mesh visibility: the node remembers 40 peers instead of 60
+// and evicts the oldest beyond that, which only bites on a dense mesh.
 #define MAX_NUM_NODES 60
 
 // Framerate used WHILE A TRANSITION IS RUNNING (menu moves, screen changes) - it is not
