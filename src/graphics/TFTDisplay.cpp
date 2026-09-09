@@ -514,7 +514,9 @@ class LGFX : public lgfx::LGFX_Device
     lgfx::Bus_SPI _bus_instance;
     lgfx::Light_PWM _light_instance;
 #if HAS_TOUCHSCREEN
-#if defined(T_WATCH_S3) || defined(ELECROW)
+#if defined(USE_XPT2046)
+    lgfx::Touch_XPT2046 _touch_instance;
+#elif defined(T_WATCH_S3) || defined(ELECROW)
     lgfx::Touch_FT5x06 _touch_instance;
 #elif defined(HELTEC_V4_TFT) || defined(HELTEC_V4_R8_TFT)
     lgfx::TOUCH_CHSC6X _touch_instance;
@@ -616,6 +618,39 @@ class LGFX : public lgfx::LGFX_Device
 #endif
 
 #if HAS_TOUCHSCREEN
+#if defined(USE_XPT2046)
+        // Resistive SPI touch, not the I2C capacitive part the rest of this block assumes.
+        // Mirrors the XPT2046 setup in the ILI9341 block: boards sold as ESP32-2432S028R
+        // ship with either panel controller but the same XPT2046 on its own dedicated pins.
+        {
+            auto touch_cfg = _touch_instance.config();
+
+            // These live in an anonymous union with no default initialisers, so set all four.
+            // spi_host = -1 selects the driver's bit-bang path, which suits the dedicated
+            // touch pins - no hardware SPI host shared with the panel.
+            touch_cfg.spi_host = -1;
+            touch_cfg.pin_sclk = TOUCH_SCLK;
+            touch_cfg.pin_mosi = TOUCH_MOSI;
+            touch_cfg.pin_miso = TOUCH_MISO;
+
+            touch_cfg.pin_cs = TOUCH_CS;
+            // Leave pin_int unset: the driver bails out of getTouchRaw() before any SPI
+            // read whenever this pin reads high, and GPIO34-39 have no internal pullup.
+            touch_cfg.pin_int = -1;
+            touch_cfg.freq = 2500000;     // XPT2046 max; matches TFT_eSPI SPI_TOUCH_FREQUENCY
+            touch_cfg.bus_shared = false; // dedicated pins - no panel-bus arbitration needed
+
+            // Raw ADC span the controller reports at the panel edges.
+            touch_cfg.x_min = 300;
+            touch_cfg.x_max = 3900;
+            touch_cfg.y_min = 400;
+            touch_cfg.y_max = 3900;
+            touch_cfg.offset_rotation = 0;
+
+            _touch_instance.config(touch_cfg);
+            _panel_instance.setTouch(&_touch_instance);
+        }
+#else
         // Configure settings for touch screen control.
         {
             auto cfg = _touch_instance.config();
@@ -648,6 +683,7 @@ class LGFX : public lgfx::LGFX_Device
             _touch_instance.config(cfg);
             _panel_instance.setTouch(&_touch_instance);
         }
+#endif
 #endif
 
         setPanel(&_panel_instance); // Sets the panel to use.
