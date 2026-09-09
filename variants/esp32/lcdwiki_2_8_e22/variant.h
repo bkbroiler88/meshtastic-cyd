@@ -49,6 +49,17 @@
 #define GPS_SHARES_UART0
 #define GPS_BAUDRATE 9600
 
+// Use UART2 rather than Meshtastic's default UART1, matching cyd-bulb-controller,
+// which drives an ATGM336H on these same GPIO3/GPIO1 pins from UART2
+// (src/m5_gps.cpp: HardwareSerial gpsSerial(2)). On a classic ESP32 the UART1
+// default pins (GPIO9/GPIO10) belong to the SPI flash, so UART2 is the safer of
+// the two to remap.
+//
+// Chosen while chasing a receiver that read zero bytes at every baud rate; that
+// turned out to be a failed GPS module, NOT the UART. So this is "match the known
+// working reference", not a fix for that symptom - UART1 may well be fine.
+#define GPS_SERIAL_PORT Serial2
+
 // Display - HSPI bus. Panel CONTROLLER is selected below; see the note there.
 #define HAS_SPI_TFT 1
 #define USE_TFTDISPLAY 1
