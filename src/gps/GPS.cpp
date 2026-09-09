@@ -2037,7 +2037,13 @@ std::unique_ptr<GPS> GPS::createGps()
         // serial console for nothing.
         constexpr int8_t kUart0RxPin = 3; // ESP32 UART0 RX (USB serial console)
         constexpr int8_t kUart0TxPin = 1; // ESP32 UART0 TX
-        if (new_gps->rx_gpio == kUart0RxPin || new_gps->tx_gpio == kUart0TxPin) {
+        // Symmetric on purpose. Swapping rx_gpio/tx_gpio from the app is a natural thing to
+        // try when a receiver looks dead, and an asymmetric test (rx==3 || tx==1) misses
+        // rx_gpio=1: the GPS UART then takes GPIO1 - UART0's TRANSMIT pin - and the debug
+        // log goes silent, which looks like a hung board rather than a pin conflict.
+        const bool gpsOnUart0 = (new_gps->rx_gpio == kUart0RxPin || new_gps->rx_gpio == kUart0TxPin ||
+                                 new_gps->tx_gpio == kUart0RxPin || new_gps->tx_gpio == kUart0TxPin);
+        if (gpsOnUart0) {
             // Each UART gives up the pin the other needs:
             //   UART0 keeps TX on GPIO1 so debug logging still works, RX detached (-1)
             //   GPS keeps its RX pin for NMEA, TX detached (-1) so it cannot displace UART0_TX
@@ -2047,7 +2053,47 @@ std::unique_ptr<GPS> GPS::createGps()
             LOG_INFO("GPS on GPIO%d collides with UART0: detached UART0 RX, GPS is RX-only. "
                      "Serial log still works but the serial CLI will not",
                      new_gps->rx_gpio);
-            _serial_gps->begin(GPS_BAUDRATE, SERIAL_8N1, new_gps->rx_gpio, -1);
+            // Probing is a conversation: every detection step writes a command ($PDTINFO,
+            // $PCAS06, UBX CFG frames...) and waits for a reply. With TX detached nothing
+            // is ever sent, every probe times out, and setup() loops forever on
+            // "No GNSS Module" - the receiver is talking but is never identified.
+            //
+            // GENERIC_NMEA is the existing escape hatch for exactly this shape of source
+            // (it is what gpsd uses): skip chip-specific probe and init, and just parse
+            // the NMEA that arrives.
+            new_gps->gnssModel = GNSS_MODEL_GENERIC_NMEA;
+
+            // We cannot ask the receiver to change baud, but we CAN listen at each rate and
+            // see which one produces framed sentences - sawNmeaSentenceAtBaud() is passive,
+            // it only watches for "$...,". Without this the hardcoded GPS_BAUDRATE is a
+            // guess, and a module streaming at 38400 looks identical to one that is not
+            // wired at all: both yield zero valid sentences forever.
+            static const uint32_t kRxOnlyBauds[] = {GPS_BAUDRATE, 9600, 38400, 115200, 57600, 19200, 4800};
+            uint32_t chosenBaud = 0;
+            uint32_t bytesSeenAtBest = 0;
+            for (uint32_t baud : kRxOnlyBauds) {
+                _serial_gps->begin(baud, SERIAL_8N1, new_gps->rx_gpio, -1);
+                delay(50); // let the line settle before counting
+                if (sawNmeaSentenceAtBaud(_serial_gps, 1200)) {
+                    chosenBaud = baud;
+                    break;
+                }
+                // No sentence: record whether ANYTHING arrived, which separates "wrong baud"
+                // (bytes present, never framed) from "nothing connected" (silence at every rate).
+                bytesSeenAtBest += _serial_gps->available();
+            }
+
+            if (chosenBaud) {
+                _serial_gps->begin(chosenBaud, SERIAL_8N1, new_gps->rx_gpio, -1);
+                LOG_INFO("GPS is RX-only: generic NMEA detected at %u baud on GPIO%d", (unsigned)chosenBaud,
+                         new_gps->rx_gpio);
+            } else {
+                _serial_gps->begin(GPS_BAUDRATE, SERIAL_8N1, new_gps->rx_gpio, -1);
+                LOG_WARN("GPS is RX-only: NO NMEA at any baud on GPIO%d (%u stray bytes seen). "
+                         "Bytes but no sentences means wrong framing; zero bytes means nothing is "
+                         "reaching the pin. Falling back to %d",
+                         new_gps->rx_gpio, (unsigned)bytesSeenAtBest, GPS_BAUDRATE);
+            }
         } else {
             // tx_gpio == 0 means "unset", not "GPIO0" - and GPIO0 is the boot button on
             // this board, so hand the UART -1 rather than letting it drive that pin.
