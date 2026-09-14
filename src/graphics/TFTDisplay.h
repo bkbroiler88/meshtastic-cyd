@@ -38,6 +38,15 @@ class TFTDisplay : public OLEDDisplay
     // Functions for changing display brightness
     void setDisplayBrightness(uint8_t);
 
+#ifdef LCDWIKI_PANEL_INVERT_TOGGLE
+    /// Panel-level colour inversion (the controller's INVON/INVOFF command), not a UI
+    /// theme. CYD panels ship with either polarity under the same product name, so the
+    /// correct setting is per-board and has to be a user control. Applies immediately
+    /// and persists in NVS; re-applied from init().
+    void setDisplayInverted(bool inverted);
+    static bool getDisplayInverted();
+#endif
+
     /**
      * shim to make the abstraction happy
      *

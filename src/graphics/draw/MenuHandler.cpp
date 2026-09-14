@@ -2562,11 +2562,12 @@ void menuHandler::screenOptionsMenu()
     optionsEnumArray[options++] = Theme;
 #endif
 
-    // Applies immediately - SharedUIDisplay picks the palette from displaymode per draw.
-    optionsArray[options] = (config.display.displaymode == meshtastic_Config_DisplayConfig_DisplayMode_INVERTED)
-                                ? "Invert Colors: On"
-                                : "Invert Colors: Off";
+#ifdef LCDWIKI_PANEL_INVERT_TOGGLE
+    // Panel-level inversion (the controller's INVON/INVOFF), not config.display.displaymode -
+    // that one only drives the monochrome header bitmap and is inert on a colour TFT.
+    optionsArray[options] = TFTDisplay::getDisplayInverted() ? "Invert Colors: On" : "Invert Colors: Off";
     optionsEnumArray[options++] = InvertColors;
+#endif
 
 #ifdef SCREEN_ROTATE_RUNTIME
     optionsArray[options] = config.display.flip_screen ? "Orientation: Landscape" : "Orientation: Portrait";
@@ -2594,14 +2595,15 @@ void menuHandler::screenOptionsMenu()
         } else if (selected == Theme) {
             menuHandler::menuQueue = menuHandler::ThemeMenu;
             screen->runNow();
+#ifdef LCDWIKI_PANEL_INVERT_TOGGLE
         } else if (selected == InvertColors) {
-            config.display.displaymode = (config.display.displaymode == meshtastic_Config_DisplayConfig_DisplayMode_INVERTED)
-                                             ? meshtastic_Config_DisplayConfig_DisplayMode_DEFAULT
-                                             : meshtastic_Config_DisplayConfig_DisplayMode_INVERTED;
-            service->reloadConfig(SEGMENT_CONFIG);
-            // Reopen so the label reflects the new state.
+            // Flips the panel controller itself and persists to NVS; no reboot, no config
+            // write. Reopen so the label reflects the new state.
+            static_cast<TFTDisplay *>(screen->getDisplayDevice())
+                ->setDisplayInverted(!TFTDisplay::getDisplayInverted());
             menuHandler::menuQueue = menuHandler::ScreenOptionsMenu;
             screen->runNow();
+#endif
 #ifdef SCREEN_ROTATE_RUNTIME
         } else if (selected == Orientation) {
             menuHandler::menuQueue = menuHandler::OrientationPicker;

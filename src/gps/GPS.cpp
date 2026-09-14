@@ -2049,8 +2049,18 @@ std::unique_ptr<GPS> GPS::createGps()
             //   GPS keeps its RX pin for NMEA, TX detached (-1) so it cannot displace UART0_TX
             // Cost while split: we cannot transmit to the receiver, so no autobaud and no
             // runtime reconfiguration - it must already emit NMEA at GPS_BAUDRATE.
+            // end() first. Passing rxPin = -1 to begin() does NOT detach a pin - the core
+            // reads it as "keep whatever is configured":
+            //   HardwareSerial.cpp: rxPin = rxPin < 0 ? _rxPin : rxPin;
+            // SerialConsole has already done Port.begin(SERIAL_BAUD) on UART0 with default
+            // pins by this point, so GPIO3 is firmly attached and a begin(-1) leaves it
+            // that way. UART2 then loses the pin and reads zero bytes forever, at every
+            // baud, however the receiver is wired - with nothing in any log to say why.
+            // HardwareSerial::end() calls uartEnd(), which detaches all pins and deletes
+            // the driver; the begin() after it re-creates UART0 as transmit-only.
+            Serial.end();
             Serial.begin(115200, SERIAL_8N1, -1, kUart0TxPin);
-            LOG_INFO("GPS on GPIO%d collides with UART0: detached UART0 RX, GPS is RX-only. "
+            LOG_INFO("GPS on GPIO%d collides with UART0: released UART0 RX, GPS is RX-only. "
                      "Serial log still works but the serial CLI will not",
                      new_gps->rx_gpio);
             // Probing is a conversation: every detection step writes a command ($PDTINFO,
@@ -2070,29 +2080,63 @@ std::unique_ptr<GPS> GPS::createGps()
             // wired at all: both yield zero valid sentences forever.
             static const uint32_t kRxOnlyBauds[] = {GPS_BAUDRATE, 9600, 38400, 115200, 57600, 19200, 4800};
             uint32_t chosenBaud = 0;
-            uint32_t bytesSeenAtBest = 0;
+            uint32_t bytesAtChosen = 0;
+            uint32_t bytesSeenTotal = 0;
+
             for (uint32_t baud : kRxOnlyBauds) {
+                // end() before re-begin: reconfiguring a live UART in place leaves the
+                // driver holding the old pin matrix and ring buffer, so later rates in this
+                // loop would read whatever the first one left behind.
+                _serial_gps->end();
                 _serial_gps->begin(baud, SERIAL_8N1, new_gps->rx_gpio, -1);
                 delay(50); // let the line settle before counting
-                if (sawNmeaSentenceAtBaud(_serial_gps, 1200)) {
+
+                // Count and frame in ONE pass. sawNmeaSentenceAtBaud() consumes what it
+                // reads, so asking available() afterwards reports the drained buffer, not
+                // what arrived - that reads as "zero bytes" whether the receiver is silent
+                // or streaming perfectly, which is exactly the wrong thing to be sure about.
+                uint32_t bytes = 0;
+                bool sawDollar = false, sawComma = false, framed = false;
+                const uint32_t deadline = millis() + 1200;
+                while (!framed && (int32_t)(millis() - deadline) < 0) {
+                    while (_serial_gps->available()) {
+                        const char c = static_cast<char>(_serial_gps->read());
+                        bytes++;
+                        if (c == '$') {
+                            sawDollar = true;
+                            sawComma = false;
+                        } else if (c == ',') {
+                            sawComma = true;
+                        } else if (c == '\n' || c == '\r') {
+                            if (sawDollar && sawComma) {
+                                framed = true;
+                                break;
+                            }
+                            sawDollar = sawComma = false;
+                        }
+                    }
+                }
+
+                bytesSeenTotal += bytes;
+                LOG_DEBUG_GPS("GPS baud probe %u: %u bytes, framed=%d", (unsigned)baud, (unsigned)bytes, (int)framed);
+                if (framed) {
                     chosenBaud = baud;
+                    bytesAtChosen = bytes;
                     break;
                 }
-                // No sentence: record whether ANYTHING arrived, which separates "wrong baud"
-                // (bytes present, never framed) from "nothing connected" (silence at every rate).
-                bytesSeenAtBest += _serial_gps->available();
             }
 
+            _serial_gps->end();
             if (chosenBaud) {
                 _serial_gps->begin(chosenBaud, SERIAL_8N1, new_gps->rx_gpio, -1);
-                LOG_INFO("GPS is RX-only: generic NMEA detected at %u baud on GPIO%d", (unsigned)chosenBaud,
-                         new_gps->rx_gpio);
+                LOG_INFO("GPS is RX-only: generic NMEA at %u baud on GPIO%d (%u bytes)", (unsigned)chosenBaud,
+                         new_gps->rx_gpio, (unsigned)bytesAtChosen);
             } else {
                 _serial_gps->begin(GPS_BAUDRATE, SERIAL_8N1, new_gps->rx_gpio, -1);
-                LOG_WARN("GPS is RX-only: NO NMEA at any baud on GPIO%d (%u stray bytes seen). "
-                         "Bytes but no sentences means wrong framing; zero bytes means nothing is "
-                         "reaching the pin. Falling back to %d",
-                         new_gps->rx_gpio, (unsigned)bytesSeenAtBest, GPS_BAUDRATE);
+                LOG_WARN("GPS is RX-only: no NMEA at any baud on GPIO%d; %u bytes total across all rates. "
+                         "Nonzero means the line is live but framing is wrong; zero means nothing reaches "
+                         "the pin. Falling back to %d",
+                         new_gps->rx_gpio, (unsigned)bytesSeenTotal, GPS_BAUDRATE);
             }
         } else {
             // tx_gpio == 0 means "unset", not "GPIO0" - and GPIO0 is the boot button on

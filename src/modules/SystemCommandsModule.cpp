@@ -67,7 +67,16 @@ int SystemCommandsModule::handleInputEvent(const InputEvent *event)
 #else
         if (!config.bluetooth.enabled) {
             disableBluetooth();
+#if defined(SDCARD_EXCLUSIVE_WITH_BLUETOOTH)
+            // The SD card on this board is gated on Bluetooth being off (see the
+            // SD/Bluetooth gate in main.cpp), so switching Bluetooth off has to reboot as
+            // well: the card can only be mounted during setup(), so without this the
+            // card stays absent until the next power cycle and the switch looks broken.
+            IF_SCREEN(screen->showSimpleBanner("Bluetooth OFF\nRebooting", 3000));
+            rebootAtMsec = millis() + DEFAULT_REBOOT_SECONDS * 1000;
+#else
             IF_SCREEN(screen->showSimpleBanner("Bluetooth OFF", 3000));
+#endif
         } else {
             IF_SCREEN(screen->showSimpleBanner("Bluetooth ON\nRebooting", 3000));
             rebootAtMsec = millis() + DEFAULT_REBOOT_SECONDS * 1000;

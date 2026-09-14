@@ -44,6 +44,7 @@ extern NicheGraphics::BaseUIEInkDisplay *setupNicheGraphicsBaseUI();
 #include "TimeFormatters.h"
 #include "draw/ClockRenderer.h"
 #include "draw/DebugRenderer.h"
+#include "draw/MapRenderer.h"
 #include "draw/MenuHandler.h"
 #include "draw/MessageRenderer.h"
 #include "draw/NodeListRenderer.h"
@@ -1432,6 +1433,12 @@ void Screen::setFrames(FrameFocus focus)
     }
 #endif
 
+#if defined(BASEUI_HAS_MAP)
+    fsi.positions.map = numframes;
+    normalFrames[numframes++] = graphics::MapRenderer::drawMapFrame;
+    indicatorIcons.push_back(icon_compass);
+#endif
+
     fsi.positions.textMessage = numframes;
     normalFrames[numframes++] = graphics::MessageRenderer::drawTextMessageFrame;
     indicatorIcons.push_back(icon_mail);
@@ -2153,6 +2160,17 @@ int Screen::handleInputEvent(const InputEvent *event)
         menuHandler::handleMenuSwitch(dispdev);
         return 0;
     }
+#if defined(BASEUI_HAS_MAP)
+    // The map owns taps that land on its own controls or markers. Anything else -
+    // notably left/right swipes - falls through so the carousel still works.
+    if (framesetInfo.positions.map != 255 && ui->getUiState()->currentFrame == framesetInfo.positions.map) {
+        if (graphics::MapRenderer::handleInput(event)) {
+            setFastFramerate();
+            return 0;
+        }
+    }
+#endif
+
     // UP/DOWN in message screen scrolls through message threads
     if (ui->getUiState()->currentFrame == framesetInfo.positions.textMessage) {
 

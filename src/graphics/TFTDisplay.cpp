@@ -1673,6 +1673,54 @@ void TFTDisplay::setDisplayBrightness(uint8_t _brightness)
 #endif
 }
 
+#ifdef LCDWIKI_PANEL_INVERT_TOGGLE
+// Panel-level inversion. tft->invertDisplay() sends the controller's INVON/INVOFF
+// command; this is NOT config.display.displaymode, which only drives the monochrome
+// header bitmap in SharedUIDisplay and is inert once GRAPHICS_TFT_COLORING_ENABLED is on.
+//
+// Boards sold as ESP32-2432S028R ship panels of either polarity under one product name,
+// so which way round looks right is a per-board fact and has to be a user control.
+// Stored in NVS rather than uiconfig because DeviceUIConfig has no field for it and
+// adding one would mean regenerating protobufs.
+static bool tftInverted = false;
+
+bool TFTDisplay::getDisplayInverted()
+{
+    return tftInverted;
+}
+
+void TFTDisplay::setDisplayInverted(bool inverted)
+{
+    tftInverted = inverted;
+    if (tft)
+        tft->invertDisplay(inverted);
+#ifdef ARCH_ESP32
+    Preferences prefs;
+    if (prefs.begin("tftpanel", false)) {
+        prefs.putBool("invert", inverted);
+        prefs.end();
+    }
+#endif
+    LOG_INFO("Panel inversion %s", inverted ? "ON" : "OFF");
+}
+
+/// Restore the saved inversion at boot. Separate from setDisplayInverted() so init()
+/// does not write back the value it just read.
+static void tftRestoreInversion()
+{
+#ifdef ARCH_ESP32
+    Preferences prefs;
+    if (prefs.begin("tftpanel", true)) {
+        tftInverted = prefs.getBool("invert", false);
+        prefs.end();
+    }
+#endif
+    if (tft)
+        tft->invertDisplay(tftInverted);
+    LOG_INFO("Panel inversion restored: %s", tftInverted ? "ON" : "OFF");
+}
+#endif
+
 void TFTDisplay::flipScreenVertically()
 {
 #if defined(T_WATCH_S3)
@@ -1777,6 +1825,10 @@ bool TFTDisplay::connect()
     tft->setRotation(TFT_ROTATION); // Orient horizontal and wide underneath the silkscreen name label
 #endif
     tft->fillScreen(getThemeDefaultOffColor());
+
+#ifdef LCDWIKI_PANEL_INVERT_TOGGLE
+    tftRestoreInversion();
+#endif
 
 #if defined(USE_XPT2046)
     // hasTouch() is never called anywhere, so a panel with no touch driver bound

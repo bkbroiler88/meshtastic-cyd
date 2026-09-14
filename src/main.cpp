@@ -1,4 +1,7 @@
 #include "configuration.h"
+#ifdef ARCH_ESP32
+#include "esp_heap_caps.h"
+#endif
 #ifdef ARCH_PORTDUINO_WASM
 #include <emscripten.h>
 #endif
@@ -832,9 +835,11 @@ void setup()
     scannerToSensorsMap(i2cScanner, ScanI2C::DeviceType::MAX30102, meshtastic_TelemetrySensorType_MAX30102);
 #endif
 
-#ifdef HAS_SDCARD
+#if defined(HAS_SDCARD) && !defined(SDCARD_EXCLUSIVE_WITH_BLUETOOTH)
     setupSDCard();
 #endif
+    // Boards that define SDCARD_EXCLUSIVE_WITH_BLUETOOTH mount the card later instead, once
+    // config is loaded - see the SD/Bluetooth gate after nodeDB is constructed.
 
     // Hello
     printInfo();
@@ -868,6 +873,33 @@ void setup()
     // Config is loaded now, and Bluetooth has not been initialized yet. If the
     // saved config will keep Bluetooth inactive, return its reserved memory early.
     esp32ReleaseBluetoothMemoryIfUnused();
+#endif
+
+#if defined(HAS_SDCARD) && defined(SDCARD_EXCLUSIVE_WITH_BLUETOOTH)
+    // SD and Bluetooth are mutually exclusive on this board - there is not enough
+    // 8-bit DRAM for both, and it is not close. Measured on the LCDWIKI 2.8 variant:
+    //
+    //   pool at start of setup()          124,608 bytes of MALLOC_CAP_8BIT
+    //   mounting the SD card                -30,408
+    //   Meshtastic core, UI, radio, modules -71,172
+    //   left when NimBLE initialises          23,028   <- NimBLE needs more than this
+    //
+    // and it aborts in lock_init_generic creating a mutex, which shows up as a reboot
+    // loop the moment Bluetooth is switched on. Note that "free heap" reads ~64 KB at
+    // that point and is misleading: ~41 KB of it is IRAM handed to the heap, which can
+    // never satisfy a byte-addressable allocation.
+    //
+    // So the card follows Bluetooth: BLE off -> card mounted, the whole of it available
+    // for maps; BLE on -> card skipped and the map falls back to internal flash. This
+    // runs here rather than earlier in setup() because it needs config, which is only
+    // loaded once nodeDB exists, immediately above.
+    if (!config.bluetooth.enabled) {
+        const uint32_t before8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+        setupSDCard();
+        LOG_INFO("SD mounted (Bluetooth off): 8bit %u -> %u", before8, heap_caps_get_free_size(MALLOC_CAP_8BIT));
+    } else {
+        LOG_INFO("SD skipped: Bluetooth is on and they cannot both fit in DRAM");
+    }
 #endif
 
     // Initialize transmit history to persist broadcast throttle timers across reboots

@@ -97,6 +97,17 @@
 //
 // Select the ST7789 board with -DLCDWIKI_PANEL_ST7789=1 (see platformio.ini); the
 // default is the ILI9341.
+
+// CYD panels ship with either colour polarity under the same product name, so which
+// way round looks correct is a per-board fact rather than a per-model one. Exposes
+// a Display Options entry that drives the controller's INVON/INVOFF via
+// invertDisplay(), persisted in NVS. cyd-bulb-controller does the same thing
+// (src/main.cpp applyInversion()).
+//
+// NOT config.display.displaymode INVERTED - that only styles the monochrome header
+// bitmap in SharedUIDisplay and does nothing once GRAPHICS_TFT_COLORING_ENABLED is on.
+#define LCDWIKI_PANEL_INVERT_TOGGLE 1
+
 #ifndef LCDWIKI_PANEL_ST7789
 #define LCDWIKI_PANEL_ST7789 0
 #endif
@@ -171,9 +182,28 @@
 // entry never appears. See CannedMessageModule.cpp.
 #define USE_VIRTUAL_KEYBOARD 1
 
-// SD card: Meshtastic has no per-pin SD macros - the SD card rides whatever bus
-// SPI.begin() was called with, which here is the LoRa bus (18/19/23). Enabling it
-// requires defining HAS_SDCARD plus SDCARD_CS; left off until the radio is proven.
+// SD card. The slot rides the LoRa bus (VSPI 18/19/23) with its own CS on GPIO5, which
+// is the ESP32-2432S028R stock wiring and also the esp32dev default SS.
+//
+// setupSDCard() (FSCommon.cpp:440) takes spiLock around SPI.begin()/SD.begin(), so the
+// bus is arbitrated against the SX1262 - but ONLY for setup. Any later read has to take
+// spiLock itself or it will corrupt a LoRa transaction in flight; see BaseMap.cpp.
+//
+// SPI_SCK/MISO/MOSI are referenced by FSCommon.cpp but are not defined anywhere in src/ -
+// every variant that enables HAS_SDCARD has to supply them, or the build fails on an
+// undeclared identifier at that one line.
+#define HAS_SDCARD 1
+#define SDCARD_CS 5
+#define SPI_SCK 18
+#define SPI_MISO 19
+#define SPI_MOSI 23
+
+// The card and Bluetooth do not both fit in this board's 8-bit DRAM (no PSRAM): mounting
+// the card takes 30,408 bytes and NimBLE then aborts at init with 23,028 left. With this
+// set, main.cpp mounts the card only while Bluetooth is off, toggling Bluetooth reboots
+// in both directions, and the map frame explains itself when Bluetooth is on. Boards with
+// PSRAM run both fine and should not define it.
+#define SDCARD_EXCLUSIVE_WITH_BLUETOOTH 1
 
 // Selects the SX1262 driver in RadioInterface.cpp. Without this the whole
 // SX1262Interface block is compiled out and the radio is never probed at all,
@@ -193,9 +223,16 @@
 #define SX126X_DIO1 LORA_DIO1
 #define SX126X_RESET LORA_RESET
 // BUSY is mandatory for SX126x - RadioLib polls it before and after every SPI
-// command (Module.cpp:357, :394). Wired to GPIO34, which is input-only; fine here
-// since the ESP32 only ever reads it.
-#define SX126X_BUSY 34
+// command (Module.cpp:357, :394). It is a push-pull output from the SX1262, so the
+// ESP32 side needs no pull-up and only ever reads it.
+// GPIO17 is the RGB LED's blue channel, unused by the firmware; with no PSRAM on this
+// module 16/17 are not reserved, and it is not a strapping pin. The blue LED may glow
+// faintly while BUSY is low.
+// Do not move it back to GPIO34. On the QDTech 2.8" CYD that pin is not free (believed
+// to be its TP4056 charger circuit), and with BUSY there RadioLib stalled ~20 s waiting
+// for BUSY to go low, init returned -2 (CHIP_NOT_FOUND), and the node recorded critical
+// error 3 (NO_RADIO).
+#define SX126X_BUSY 17
 // Antenna switch, split across two sides:
 //
 // TX side: DIO2_AS_RF_SWITCH is a CHIP setting, not a pin. It goes over SPI as
