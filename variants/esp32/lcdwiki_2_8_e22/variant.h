@@ -28,6 +28,19 @@
 #define BUTTON_PIN 0 // GPIO 0, pulled low to activate
 #define BUTTON_NEED_PULLUP
 
+// Battery sense on GPIO34 (ADC1 channel 6). The QDTech 2.8" CYD carries a TP4056 charger
+// and is believed to bring the battery to this pin through a resistor divider.
+// ADC_MULTIPLIER is PROVISIONAL - the divider ratio has not been measured. Calibrate it by
+// comparing the reported battery voltage with a meter across the cell, then set it here,
+// or at runtime with no reflash via config.power.adc_multiplier_override (Power.cpp:435).
+// Err high, not low: with no USB-detect pin, a reading between 2600 and 3100 mV counts as
+// an empty battery on no USB, and Power.cpp deep-sleeps the node after 11 such readings.
+// The default 12 dB attenuation reads ~150-3100 mV at the pin, enough for a Li-ion behind
+// a 1:1 divider (4.2 V -> 2.1 V).
+#define BATTERY_PIN 34
+#define ADC_CHANNEL ADC_CHANNEL_6
+#define ADC_MULTIPLIER 2.0
+
 // NOTE: HAS_WIRE 0 was tried here and caused repeated
 // "Wire.cpp endTransmission(): NULL TX buffer pointer" errors, because the I2C
 // scanner still runs. Left enabled; the theoretical GPIO21 clash never manifested.
