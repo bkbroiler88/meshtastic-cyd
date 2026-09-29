@@ -19,18 +19,31 @@ LAYER_STYLE = {
 LAYER_NAME = {0: "water", 1: "major", 2: "minor", 3: "local"}
 
 
-def read_section(buf, off, length):
+def read_name(buf, name_off, nid):
+    """v2 name id is a byte offset into the name blob of a length-prefixed string."""
+    if nid == 0xFFFF or name_off == 0:
+        return ""
+    ln = buf[name_off + nid]
+    return buf[name_off + nid + 1:name_off + nid + 1 + ln].decode("utf-8", "replace")
+
+
+def read_section(buf, off, length, version=2, name_off=0):
     ways = []
     if length < 4:
         return ways
     (n,) = struct.unpack_from("<I", buf, off)
     p = off + 4
     for _ in range(n):
-        layer, npts = struct.unpack_from("<BH", buf, p)
-        p += 3
+        if version >= 2:
+            layer, npts, nid = struct.unpack_from("<BHH", buf, p)
+            p += 5
+        else:
+            layer, npts = struct.unpack_from("<BH", buf, p)
+            nid = 0xFFFF
+            p += 3
         pts = struct.unpack_from(f"<{npts * 2}h", buf, p)
         p += npts * 4
-        ways.append((layer, list(zip(pts[0::2], pts[1::2]))))
+        ways.append((layer, list(zip(pts[0::2], pts[1::2])), read_name(buf, name_off, nid)))
     return ways
 
 
@@ -50,24 +63,30 @@ def main():
         raise SystemExit(f"bad magic {magic!r}")
     lat0_i, lon0_i = struct.unpack_from("<ii", buf, 8)
     half_m, cell_m = struct.unpack_from("<II", buf, 16)
-    print(f"v{ver} grid={grid}x{grid} origin={lat0_i / 1e7:.5f},{lon0_i / 1e7:.5f} "
-          f"half={half_m}m cell={cell_m}m")
-
+    name_off = name_len = 0
     table_off = 24
+    if ver >= 2:
+        name_off, name_len = struct.unpack_from("<II", buf, 24)
+        table_off = 32
+    print(f"v{ver} grid={grid}x{grid} origin={lat0_i / 1e7:.5f},{lon0_i / 1e7:.5f} "
+          f"half={half_m}m cell={cell_m}m names={name_len}B")
+
     entries = 1 + grid * grid
     table = [struct.unpack_from("<II", buf, table_off + i * 8) for i in range(entries)]
 
-    ways = read_section(buf, *table[0])
+    ways = read_section(buf, table[0][0], table[0][1], ver, name_off)
     print(f"overview: {len(ways)} ways")
     if not args.overview_only:
-        for i, (off, ln) in enumerate(table[1:]):
-            ways += read_section(buf, off, ln)
+        for off, ln in table[1:]:
+            ways += read_section(buf, off, ln, ver, name_off)
         print(f"total with detail: {len(ways)} ways")
 
     counts = {}
-    for layer, _ in ways:
+    for layer, _, _ in ways:
         counts[layer] = counts.get(layer, 0) + 1
     print("  " + ", ".join(f"{LAYER_NAME[k]}={v}" for k, v in sorted(counts.items())))
+    named = sorted({w[2] for w in ways if w[2]})
+    print(f"  {len(named)} distinct names, e.g. {', '.join(named[:5])}")
 
     S = args.size
     scale = S / (2.0 * half_m)
@@ -86,7 +105,7 @@ def main():
     # draw water first, then roads on top - same order as the renderer
     for want in (0, 3, 2, 1):
         colour, w = LAYER_STYLE[want]
-        for layer, pts in ways:
+        for layer, pts, _name in ways:
             if layer != want:
                 continue
             d = " ".join(

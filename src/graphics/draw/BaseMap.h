@@ -45,8 +45,22 @@ bool available();
 void prepare(double viewOriginLat, double viewOriginLon, float mPerPx, int16_t halfSpanPx);
 
 /// Draw the loaded lines. Clipped to the transform's rect so nothing spills into the
-/// header or the navigation bar.
+/// header or the navigation bar. Also collects street-label candidates for drawLabels().
 void draw(OLEDDisplay *display, const Transform &t);
+
+/// Clear the per-frame label candidates and reserved boxes. Call before draw().
+void beginFrame();
+
+/// Mark a screen rectangle as taken, so no street label is drawn over it. The map frame
+/// reserves its own position marker, every node name, the scale bar and the detail line;
+/// a label that would land on any of them is dropped rather than moved, because a name
+/// shifted away from its road is worse than no name.
+void reserve(int16_t x, int16_t y, int16_t w, int16_t h);
+
+/// Draw street names, after the markers have reserved their space. Horizontal only -
+/// OLEDDisplay cannot rotate text - knocked out of the background, ranked by road class
+/// and visible length, and switched off entirely above ~8 m/px.
+void drawLabels(OLEDDisplay *display, const Transform &t);
 
 /// Metre offset from the view origin to the basemap origin, filled by prepare().
 void getOriginOffset(float &offsetE, float &offsetN);

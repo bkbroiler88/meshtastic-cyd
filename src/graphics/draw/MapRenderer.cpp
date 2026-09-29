@@ -11,6 +11,7 @@
 #include "graphics/draw/UIRenderer.h"
 #include "input/InputBroker.h"
 #include "main.h"
+#include "mesh/Throttle.h"
 #include <cmath>
 
 namespace graphics
@@ -42,6 +43,13 @@ constexpr uint32_t kStaleAfterSec = 900; // 15 min without being heard = hollow 
 // switches between 240x320 portrait and 320x240 landscape at runtime, so it cannot be a
 // constant.
 int16_t scrW = 320;
+
+// The swipe hint is an affordance, not a readout: it shows for a few seconds when the
+// frame is opened and then gets out of the way, because it shares the bottom of the band
+// with the nearest-node line and the two were drawing straight through each other.
+constexpr uint32_t kHintVisibleMs = 6000;
+uint32_t lastDrawMs = 0;
+uint32_t frameEnteredMs = 0;
 
 // ---------------------------------------------------------------------------
 // Projection
@@ -145,6 +153,12 @@ void MapRenderer::drawMapFrame(OLEDDisplay *display, OLEDDisplayUiState *state, 
     display->clear();
     scrW = display->getWidth();
 
+    // Other frames draw in between, so a gap means this frame was just opened.
+    const uint32_t nowMs = millis();
+    if (!Throttle::isWithinTimespanMs(lastDrawMs, 500))
+        frameEnteredMs = nowMs;
+    lastDrawMs = nowMs;
+
     MapView v;
     v.top = FONT_HEIGHT_SMALL + 1;
     v.bottom = display->getHeight() - 16;
@@ -237,7 +251,9 @@ void MapRenderer::drawMapFrame(OLEDDisplay *display, OLEDDisplayUiState *state, 
 
     // Roads and water underneath, if a basemap for this area is on the filesystem. Drawn
     // first so node markers and labels sit on top of it.
+    BaseMap::Transform mapT;
     if (haveMap) {
+        BaseMap::beginFrame();
         BaseMap::prepare(v.originLat, v.originLon, v.mPerPx, halfSpanPx);
         BaseMap::Transform t;
         BaseMap::getOriginOffset(t.offsetE, t.offsetN);
@@ -251,6 +267,7 @@ void MapRenderer::drawMapFrame(OLEDDisplay *display, OLEDDisplayUiState *state, 
         t.top = v.top;
         t.bottom = (int16_t)(v.bottom - 1);
         BaseMap::draw(display, t);
+        mapT = t;
     }
 
     // Nodes. Filled = heard recently, hollow = stale. Short name only; detail is a tap away.
@@ -289,14 +306,39 @@ void MapRenderer::drawMapFrame(OLEDDisplay *display, OLEDDisplayUiState *state, 
         else
             display->fillCircle(p.x, p.y, 3);
 
-        if (n->short_name[0])
-            display->drawString(p.x + 6, p.y - FONT_HEIGHT_SMALL / 2, n->short_name);
+        if (n->short_name[0]) {
+            const int16_t lx = (int16_t)(p.x + 6), ly = (int16_t)(p.y - FONT_HEIGHT_SMALL / 2);
+            display->drawString(lx, ly, n->short_name);
+            if (haveMap) {
+                const int16_t lw = (int16_t)display->getStringWidth(n->short_name, strlen(n->short_name), false);
+                BaseMap::reserve(lx, ly, (int16_t)(lw + 2), FONT_HEIGHT_SMALL);
+                BaseMap::reserve((int16_t)(p.x - 4), (int16_t)(p.y - 4), 9, 9); // the marker
+            }
+        }
         plotted++;
     }
 
     if (ownPosKnown)
         drawOwnPosition(display, v);
     drawScaleBar(display, v);
+
+    // Two stacked rows at the foot of the band: the nearest-node line, and above it the
+    // swipe hint while it is still showing. They used to share one row, left- and
+    // right-aligned, and overlapped as soon as either string got long.
+    const int16_t yDetail = (int16_t)(v.bottom - FONT_HEIGHT_SMALL - 12);
+    const int16_t yHint = (int16_t)(yDetail - FONT_HEIGHT_SMALL - 2);
+    const bool showHint = Throttle::isWithinTimespanMs(frameEnteredMs, kHintVisibleMs);
+
+    if (haveMap) {
+        // Reserve everything already on screen before the street names go down. The
+        // position ring especially: a knockout box over it erases the one thing the frame
+        // exists to show.
+        BaseMap::reserve((int16_t)(v.cx - 8), (int16_t)(v.cy - 8), 17, 17);
+        BaseMap::reserve(0, (int16_t)(yDetail - 2), display->getWidth(),
+                         (int16_t)(v.bottom - yDetail + 2)); // scale bar + detail line band
+        if (showHint)
+            BaseMap::reserve(0, yHint, display->getWidth(), FONT_HEIGHT_SMALL);
+    }
 
     // Detail line for the nearest node, along the bottom of the band.
     if (nearest) {
@@ -313,19 +355,26 @@ void MapRenderer::drawMapFrame(OLEDDisplay *display, OLEDDisplayUiState *state, 
             snprintf(line, sizeof(line), "%s  %.1f km  %.1fdB", nm, nearestM / 1000.0f, snrDb);
         else
             snprintf(line, sizeof(line), "%s  %d m  %.1fdB", nm, (int)nearestM, snrDb);
-        display->drawString(6, v.bottom - FONT_HEIGHT_SMALL - 12, line);
+        display->drawString(6, yDetail, line);
     } else if (plotted == 0) {
         display->setTextAlignment(TEXT_ALIGN_CENTER);
         display->drawString(v.cx, v.cy + 14, "No nodes with position");
         display->setTextAlignment(TEXT_ALIGN_LEFT);
     }
 
+    // Street names last: they need to know what every marker already claimed.
+    if (haveMap)
+        BaseMap::drawLabels(display, mapT);
+
     // The frame has no visible controls otherwise, and a screen that looks inert reads as
-    // a hang - which is exactly how the tap-consuming version presented.
-    display->setTextAlignment(TEXT_ALIGN_RIGHT);
-    display->drawString(display->getWidth() - 4, v.bottom - FONT_HEIGHT_SMALL - 12,
-                        rangePinned ? "swipe up/dn zoom" : "swipe up/dn  auto");
-    display->setTextAlignment(TEXT_ALIGN_LEFT);
+    // a hang - which is exactly how the tap-consuming version presented. Shown on entry
+    // only; the scale bar is the permanent indication of zoom.
+    if (showHint) {
+        display->setTextAlignment(TEXT_ALIGN_RIGHT);
+        display->drawString(display->getWidth() - 4, yHint,
+                            rangePinned ? "swipe up/dn zoom" : "swipe up/dn  auto");
+        display->setTextAlignment(TEXT_ALIGN_LEFT);
+    }
 }
 
 bool MapRenderer::handleInput(const InputEvent *event)

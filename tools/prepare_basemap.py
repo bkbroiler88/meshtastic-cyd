@@ -28,7 +28,13 @@ import urllib.error
 import urllib.request
 
 MAGIC = b"MBM1"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2  # v2 adds street names: a name blob plus a 2-byte id on every way
+
+# A name id is the byte offset of its length-prefixed string inside the name blob, so a
+# lookup is one seek and one read. That caps the blob at 64 KiB, which is far more than a
+# city-sized box needs (Edgewood, 24 km: ~14 KiB).
+NAME_NONE = 0xFFFF
+NAME_MAX_BYTES = 47  # bounds the firmware's on-stack buffer; longest real name here is 33
 
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
@@ -142,15 +148,21 @@ def project_all(elements, lat0, lon0):
     for el in elements:
         if el.get("type") != "way" or "geometry" not in el:
             continue
-        layer = classify(el.get("tags", {}))
+        tags = el.get("tags", {})
+        layer = classify(tags)
         if layer is None:
             continue
+        # Only roads carry a name - water is never labelled, and leaving those names out
+        # keeps the blob inside its 64 KiB addressing.
+        name = ""
+        if layer != LAYER_WATER:
+            name = (tags.get("name") or tags.get("ref") or "")[:NAME_MAX_BYTES]
         pts = [
             ((g["lon"] - lon0) * m_per_deg_lon, (g["lat"] - lat0) * m_per_deg_lat)
             for g in el["geometry"]
         ]
         if len(pts) >= 2:
-            out.append((layer, pts))
+            out.append((layer, name, pts))
     return out
 
 
@@ -162,6 +174,10 @@ def stitch(ways):
     this the output is dominated by way headers and unremovable points. Chaining first
     lets Douglas-Peucker work over the whole road. Junctions are resolved greedily: one
     arm becomes the long chain, the others stay separate, which is fine for drawing.
+
+    Grouping is keyed on (layer, name), not layer alone. Joining purely on shared endpoints
+    would weld two differently-named streets into one chain at every junction, and the
+    merged chain would then be labelled with whichever name won.
     """
     from collections import defaultdict
 
@@ -169,11 +185,11 @@ def stitch(ways):
         return (round(p[0], 2), round(p[1], 2))
 
     by_layer = defaultdict(list)
-    for layer, pts in ways:
-        by_layer[layer].append(pts)
+    for layer, name, pts in ways:
+        by_layer[(layer, name)].append(pts)
 
     out = []
-    for layer, lst in by_layer.items():
+    for (layer, name), lst in by_layer.items():
         ends = defaultdict(list)
         for i, pts in enumerate(lst):
             ends[key(pts[0])].append(i)
@@ -200,7 +216,7 @@ def stitch(ways):
                         chain += (cand[1:] if key(cand[0]) == k else list(reversed(cand))[1:])
                     else:
                         chain = (cand[:-1] if key(cand[-1]) == k else list(reversed(cand))[:-1]) + chain
-            out.append((layer, chain))
+            out.append((layer, name, chain))
     return out
 
 
@@ -251,12 +267,35 @@ def clip_to_box(pts, half_m):
     return runs
 
 
-def pack_ways(ways):
-    """ways: list of (layer, pts). Returns packed bytes for one section."""
+def build_name_blob(ways_lists):
+    """Collect distinct names into one blob; return (blob, {name: id}).
+
+    id is the byte offset of the name's length-prefixed record, so the firmware reads a
+    name with a single seek. Names are emitted longest-first only to keep the hot ones
+    early; ordering is otherwise irrelevant.
+    """
+    seen = set()
+    for lst in ways_lists:
+        for w in lst:
+            if w[1]:
+                seen.add(w[1])
+    blob, ids = bytearray(), {}
+    for name in sorted(seen):
+        enc = name.encode("utf-8")[:NAME_MAX_BYTES]
+        ids[name] = len(blob)
+        blob += bytes([len(enc)]) + enc
+    if len(blob) > NAME_NONE:
+        raise SystemExit(f"name blob {len(blob)} bytes exceeds the {NAME_NONE}-byte id space")
+    return bytes(blob), ids
+
+
+def pack_ways(ways, name_ids):
+    """ways: list of (layer, name, pts). Returns packed bytes for one section."""
     buf = bytearray()
     buf += struct.pack("<I", len(ways))
-    for layer, pts in ways:
-        buf += struct.pack("<BH", layer, len(pts))
+    for layer, name, pts in ways:
+        nid = name_ids.get(name, NAME_NONE) if name else NAME_NONE
+        buf += struct.pack("<BHH", layer, len(pts), nid)
         for x, y in pts:
             buf += struct.pack("<hh", int(round(x)), int(round(y)))
     return bytes(buf)
@@ -306,7 +345,7 @@ def main():
 
     # --- overview: one flat section, small enough to hold in RAM ---
     overview = []
-    for layer, pts in raw:
+    for layer, name, pts in raw:
         tol = TOLERANCE_OVERVIEW[layer]
         if tol is None:
             continue
@@ -318,12 +357,12 @@ def main():
                 continue
             s = simplify(run, tol)
             if len(s) >= 2:
-                overview.append((layer, s))
+                overview.append((layer, name, s))
 
     # --- detail: bucketed into a grid so the renderer reads only what it needs ---
     cell_m = (2 * half_m) / args.grid
     cells = [[] for _ in range(args.grid * args.grid)]
-    for layer, pts in raw:
+    for layer, name, pts in raw:
         tol = TOLERANCE_DETAIL[layer]
         for run in clip_to_box(pts, half_m):
             s = simplify(run, tol)
@@ -342,14 +381,15 @@ def main():
                 elif idx != cur_cell:
                     cur_pts.append((x, y))
                     if len(cur_pts) >= 2:
-                        cells[cur_cell].append((layer, cur_pts))
+                        cells[cur_cell].append((layer, name, cur_pts))
                     cur_cell, cur_pts = idx, [cur_pts[-2]] if len(cur_pts) >= 2 else []
                 cur_pts.append((x, y))
             if cur_cell is not None and len(cur_pts) >= 2:
-                cells[cur_cell].append((layer, cur_pts))
+                cells[cur_cell].append((layer, name, cur_pts))
 
-    overview_blob = pack_ways(overview)
-    cell_blobs = [pack_ways(c) for c in cells]
+    name_blob, name_ids = build_name_blob([overview] + cells)
+    overview_blob = pack_ways(overview, name_ids)
+    cell_blobs = [pack_ways(c, name_ids) for c in cells]
 
     header = bytearray()
     header += MAGIC
@@ -359,6 +399,10 @@ def main():
     header += struct.pack("<ii", int(round(args.lat * 1e7)), int(round(args.lon * 1e7)))
     header += struct.pack("<I", int(round(half_m)))
     header += struct.pack("<I", int(round(cell_m)))
+    # v2: name blob offset/len, filled in once the layout is known (header is 32 bytes)
+    name_off_pos = len(header)
+    header += struct.pack("<II", 0, 0)
+
     # overview offset/len, then one offset/len per cell
     table_entries = 1 + args.grid * args.grid
     table_size = table_entries * 8
@@ -372,22 +416,29 @@ def main():
         table += struct.pack("<II", off, len(blob))
         off += len(blob)
 
+    # the name blob sits after the sections
+    struct.pack_into("<II", header, name_off_pos, off, len(name_blob))
+    off += len(name_blob)
+
     with open(args.out, "wb") as f:
         f.write(header)
         f.write(table)
         f.write(overview_blob)
         for blob in cell_blobs:
             f.write(blob)
+        f.write(name_blob)
 
     total = off
-    ov_pts = sum(len(p) for _, p in overview)
-    det_pts = sum(len(p) for c in cells for _, p in c)
+    ov_pts = sum(len(p) for _, _, p in overview)
+    det_pts = sum(len(p) for c in cells for _, _, p in c)
     nonempty = sum(1 for b in cell_blobs if len(b) > 4)
+    named = sum(1 for c in cells for w in c if w[1])
     print(f"wrote {args.out}")
     print(f"  total      {total:,} bytes ({total / 1024:.0f} KiB)")
     print(f"  overview   {len(overview):,} ways / {ov_pts:,} pts / {len(overview_blob) / 1024:.0f} KiB")
     print(f"  detail     {sum(len(c) for c in cells):,} ways / {det_pts:,} pts across {nonempty}/{args.grid ** 2} cells")
     print(f"  largest cell {max(len(b) for b in cell_blobs) / 1024:.1f} KiB")
+    print(f"  names      {len(name_ids):,} distinct / {named:,} labelled ways / {len(name_blob) / 1024:.1f} KiB")
 
 
 if __name__ == "__main__":
