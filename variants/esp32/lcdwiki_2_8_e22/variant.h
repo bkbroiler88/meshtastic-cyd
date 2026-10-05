@@ -211,12 +211,24 @@
 #define SPI_MISO 19
 #define SPI_MOSI 23
 
-// The card and Bluetooth do not both fit in this board's 8-bit DRAM (no PSRAM): mounting
-// the card takes 30,408 bytes and NimBLE then aborts at init with 23,028 left. With this
-// set, main.cpp mounts the card only while Bluetooth is off, toggling Bluetooth reboots
-// in both directions, and the map frame explains itself when Bluetooth is on. Boards with
-// PSRAM run both fine and should not define it.
-#define SDCARD_EXCLUSIVE_WITH_BLUETOOTH 1
+// The card does not fit alongside a wireless stack in this board's 8-bit DRAM (no PSRAM):
+// mounting it takes 30,408 bytes and NimBLE then aborts at init with 23,028 left. Wi-Fi is
+// the same squeeze - it allocates its own buffers, and Meshtastic already treats Wi-Fi and
+// BLE as mutually exclusive on ESP32 (main-esp32.cpp: BLE only starts when Wi-Fi is not
+// available), so without this the card would quietly mount alongside Wi-Fi instead.
+//
+// With this set, main.cpp mounts the card only when BOTH are off. Maps are an offline
+// feature, so a node on Wi-Fi is not the case that wants them. Toggling Bluetooth reboots
+// in both directions and the map frame says which radio is holding the card off. Boards
+// with PSRAM have room for both and should not define this.
+#define SDCARD_EXCLUSIVE_WITH_BLE_WIFI 1
+
+// Tried and rejected: SDCARD_ALLOW_WITH_WIFI, mounting the card alongside Wi-Fi so the web
+// UI could be served from it. The card and Wi-Fi do fit together (117 KB of 8-bit DRAM
+// free after mounting), but the web server then has 1,504 bytes where it needs ~30 KB, and
+// its first allocation aborts. Measured, not assumed. The web UI is served from internal
+// flash instead, so the card is only ever wanted for maps - which need both radios off
+// anyway, exactly what the gate below already enforces.
 
 // Selects the SX1262 driver in RadioInterface.cpp. Without this the whole
 // SX1262Interface block is compiled out and the radio is never probed at all,

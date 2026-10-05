@@ -4,9 +4,14 @@
 #include "RadioLibInterface.h"
 #include "airtime.h"
 #include "main.h"
+#include "mesh/Channels.h"
 #include "mesh/http/ContentHelper.h"
 #include "mesh/http/WebServer.h"
 #include <memory>
+#ifdef MESHTASTIC_WEBUI_LITE
+#include "mesh/http/lite/LiteAuth.h"
+#include "mesh/http/lite/LiteUI.h"
+#endif
 #if HAS_WIFI
 #include "mesh/wifi/WiFiAPClient.h"
 #endif
@@ -86,9 +91,20 @@ void registerHandlers(HTTPServer *insecureServer, HTTPSServer *secureServer)
     ResourceNode *nodeJsonFsBrowseStatic = new ResourceNode("/json/fs/browse/static", "GET", &handleFsBrowseStatic);
     ResourceNode *nodeJsonDelete = new ResourceNode("/json/fs/delete/static", "DELETE", &handleFsDeleteStatic);
 
+    // A wildcard spans a single path segment (the resolver ends each parameter at the next
+    // '/'), so one "/*" route leaves every nested file unreachable - the web client's
+    // translations sit at /i18n/locales/<lang>/*.json and its deep links run three segments
+    // deep. Register one route per depth; they are disjoint, and handleStatic reads the whole
+    // path off the request anyway. Depth is capped rather than using setDefaultNode(), because
+    // a default node is also handed to websocket upgrades, which cast it to WebsocketNode.
     ResourceNode *nodeRoot = new ResourceNode("/*", "GET", &handleStatic);
+    ResourceNode *nodeRoot2 = new ResourceNode("/*/*", "GET", &handleStatic);
+    ResourceNode *nodeRoot3 = new ResourceNode("/*/*/*", "GET", &handleStatic);
+    ResourceNode *nodeRoot4 = new ResourceNode("/*/*/*/*", "GET", &handleStatic);
+    ResourceNode *nodeRoot5 = new ResourceNode("/*/*/*/*/*", "GET", &handleStatic);
 
-    // Secure nodes
+    // Secure nodes - absent in an HTTP-only build, where secureServer is always null
+#if !defined(MESHTASTIC_WEBSERVER_HTTP_ONLY)
     secureServer->registerNode(nodeAPIv1ToRadioOptions);
     secureServer->registerNode(nodeAPIv1ToRadio);
     secureServer->registerNode(nodeAPIv1FromRadioOptions);
@@ -101,21 +117,55 @@ void registerHandlers(HTTPServer *insecureServer, HTTPSServer *secureServer)
     secureServer->registerNode(nodeJsonReport);
     secureServer->registerNode(nodeJsonNodes);
     secureServer->registerNode(nodeAdmin);
-    secureServer->registerNode(nodeRoot); // This has to be last
+    secureServer->registerNode(nodeRoot); // These have to be last
+    secureServer->registerNode(nodeRoot2);
+    secureServer->registerNode(nodeRoot3);
+    secureServer->registerNode(nodeRoot4);
+    secureServer->registerNode(nodeRoot5);
+#else
+    (void)secureServer;
+#endif
 
     // Insecure nodes
     insecureServer->registerNode(nodeAPIv1ToRadioOptions);
     insecureServer->registerNode(nodeAPIv1ToRadio);
     insecureServer->registerNode(nodeAPIv1FromRadioOptions);
     insecureServer->registerNode(nodeAPIv1FromRadio);
+#ifndef MESHTASTIC_WEBUI_LITE
+    // The lite console is deliberately read-mostly: it reads the node and sends text, and
+    // exposes nothing that reboots it, writes its filesystem or deletes from it. Leaving
+    // these registered would keep that surface reachable behind the console's back -
+    // /restart in particular is a side-effecting GET with a wildcard CORS header.
     insecureServer->registerNode(nodeRestart);
     insecureServer->registerNode(nodeFormUpload);
-    insecureServer->registerNode(nodeJsonScanNetworks);
-    insecureServer->registerNode(nodeJsonFsBrowseStatic);
     insecureServer->registerNode(nodeJsonDelete);
+    insecureServer->registerNode(nodeJsonScanNetworks);
+#endif
+    insecureServer->registerNode(nodeJsonFsBrowseStatic);
     insecureServer->registerNode(nodeJsonReport);
+    // Upstream registers /json/nodes on the secure server only, so it 404s in an HTTP-only
+    // build. It is a read-only endpoint and the console needs it.
+    insecureServer->registerNode(nodeJsonNodes);
     insecureServer->registerNode(nodeAdmin);
-    insecureServer->registerNode(nodeRoot); // This has to be last
+
+#ifdef MESHTASTIC_WEBUI_LITE
+    // The built-in console. Registered ahead of the wildcards so it answers "/" even when a
+    // filesystem bundle is also present; anything else still falls through to handleStatic.
+    liteUIBegin();
+    insecureServer->registerNode(new ResourceNode("/", "GET", &handleLiteIndex));
+    insecureServer->registerNode(new ResourceNode("/json/messages", "GET", &handleLiteMessages));
+    insecureServer->registerNode(new ResourceNode("/json/send", "POST", &handleLiteSend));
+
+    // One gate in front of everything, including the routes above and handleStatic.
+    liteAuthBegin();
+    insecureServer->addMiddleware(&liteAuthMiddleware);
+#endif
+
+    insecureServer->registerNode(nodeRoot); // These have to be last
+    insecureServer->registerNode(nodeRoot2);
+    insecureServer->registerNode(nodeRoot3);
+    insecureServer->registerNode(nodeRoot4);
+    insecureServer->registerNode(nodeRoot5);
 }
 
 void handleAPIv1FromRadio(HTTPRequest *req, HTTPResponse *res)
@@ -209,50 +259,7 @@ void handleAPIv1ToRadio(HTTPRequest *req, HTTPResponse *res)
     LOG_DEBUG("webAPI handleAPIv1ToRadio");
 }
 
-// Escape a string into a JSON double-quoted literal. Matches the previous
-// SimpleJSON StringifyString behavior (0x00-0x1F and 0x7F -> \u00xx lowercase,
-// escapes " \ / \b \f \n \r \t, UTF-8 passes through unchanged).
-static std::string jsonEscape(const std::string &str)
-{
-    std::string out = "\"";
-    for (size_t i = 0; i < str.size(); ++i) {
-        char chr = str[i];
-        if (chr == '"' || chr == '\\' || chr == '/') {
-            out += '\\';
-            out += chr;
-        } else if (chr == '\b') {
-            out += "\\b";
-        } else if (chr == '\f') {
-            out += "\\f";
-        } else if (chr == '\n') {
-            out += "\\n";
-        } else if (chr == '\r') {
-            out += "\\r";
-        } else if (chr == '\t') {
-            out += "\\t";
-        } else if ((unsigned char)chr < 0x20 || chr == 0x7F) {
-            char buf[8];
-            snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)chr);
-            out += buf;
-        } else {
-            out += chr;
-        }
-    }
-    out += "\"";
-    return out;
-}
-
-// Format a numeric value the way the previous SimpleJSON serializer did
-// (std::stringstream with precision 15, NaN/Inf -> "null").
-static std::string jsonNum(double v)
-{
-    if (std::isinf(v) || std::isnan(v))
-        return "null";
-    std::ostringstream ss;
-    ss.precision(15);
-    ss << v;
-    return ss.str();
-}
+// jsonEscape() and jsonNum() live in ContentHelper.h so the lite console can share them.
 
 // Build a serialized JSON array string listing files in `dirname`.
 // Subdirectories recurse as nested arrays (up to `levels` deep).
@@ -386,15 +393,25 @@ void handleStatic(HTTPRequest *req, HTTPResponse *res)
     if (webServerThread)
         webServerThread->markActivity();
 
-    // Get access to the parameters
-    ResourceParameters *params = req->getParams();
+    // Take the path straight off the request rather than out of a path parameter. A wildcard
+    // in a ResourceNode matches one segment only (the resolver stops each parameter at the
+    // next '/'), so reading parameter 0 could never reach a nested file: the web client's
+    // translations live at /i18n/locales/<lang>/*.json, and its deep links are several
+    // segments deep. This handler is also the resolver's default node, which is reached with
+    // no path parameters at all.
+    {
+        std::string relPath = req->getRequestString();
+        const size_t queryStart = relPath.find('?');
+        if (queryStart != std::string::npos)
+            relPath.erase(queryStart);
+        // Strip the leading '/' - "/static/" supplies it - and refuse to walk out of /static
+        if (!relPath.empty() && relPath[0] == '/')
+            relPath.erase(0, 1);
+        if (relPath.find("..") != std::string::npos)
+            relPath.clear();
 
-    std::string parameter1;
-    // Print the first parameter value
-    if (params->getPathParameter(0, parameter1)) {
-
-        std::string filename = "/static/" + parameter1;
-        std::string filenameGzip = "/static/" + parameter1 + ".gz";
+        std::string filename = "/static/" + relPath;
+        std::string filenameGzip = "/static/" + relPath + ".gz";
 
         // Try to open the file
         File file;
@@ -467,9 +484,6 @@ void handleStatic(HTTPRequest *req, HTTPResponse *res)
         file.close();
 
         return;
-    } else {
-        LOG_ERROR("This should not have happened");
-        res->println("ERROR: This should not have happened");
     }
 }
 
@@ -695,6 +709,42 @@ void handleReport(HTTPRequest *req, HTTPResponse *res)
     out += jsonNum((int)memGet.getPsramSize());
     out += "}";
 
+    // node - identity and channel names. Nothing else in the JSON surface says who this node
+    // is or what its channels are called, which a client served BY the node needs to render
+    // its own header and channel picker without asking the user to configure a connection.
+    {
+        char myId[16];
+        snprintf(myId, sizeof(myId), "!%08x", (unsigned int)nodeDB->getNodeNum());
+        // Channels carry their role, so a client can offer the ones that are actually usable
+        // instead of guessing from the name - an unnamed secondary is still a real channel,
+        // and a DISABLED slot is not.
+        out += ",\"node\":{\"channels\":[";
+        for (ChannelIndex i = 0; i < channels.getNumChannels(); i++) {
+            if (i)
+                out += ",";
+            out += "{\"index\":";
+            out += jsonNum((int)i);
+            out += ",\"name\":";
+            out += jsonEscape(channels.getName(i));
+            out += ",\"role\":";
+            out += jsonNum((int)channels.getByIndex(i).role);
+            out += "}";
+        }
+        out += "],\"firmware\":";
+        out += jsonEscape(optstr(APP_VERSION));
+        out += ",\"id\":";
+        out += jsonEscape(myId);
+        out += ",\"long_name\":";
+        out += jsonEscape(owner.long_name);
+        out += ",\"num\":";
+        out += jsonNum((int)nodeDB->getNodeNum());
+        out += ",\"role\":";
+        out += jsonNum((int)config.device.role);
+        out += ",\"short_name\":";
+        out += jsonEscape(owner.short_name);
+        out += "}";
+    }
+
     // power (has_* / is_charging were serialized as the strings "true"/"false")
     out += ",\"power\":{";
     out += "\"battery_percent\":";
@@ -754,9 +804,14 @@ void handleNodes(HTTPRequest *req, HTTPResponse *res)
     uint32_t readIndex = 0;
     const meshtastic_NodeInfoLite *tempNodeInfo = nodeDB->readNextMeshNode(readIndex);
     while (tempNodeInfo != NULL) {
-        if (nodeInfoLiteHasUser(tempNodeInfo)) {
+        // Emit every node in the DB, not only those we have a NodeInfo packet for. A node we
+        // have heard but not yet been introduced to still has a number, an SNR and a last-heard
+        // time - the device's own screen lists it, and omitting it here made the web client
+        // look like it had discovered nothing while the mesh was still filling in.
+        {
             char id[16];
             snprintf(id, sizeof(id), "!%08x", tempNodeInfo->num);
+            const bool hasUser = nodeInfoLiteHasUser(tempNodeInfo);
 
             std::string position;
             if (nodeDB->hasValidPosition(tempNodeInfo)) {
@@ -787,18 +842,48 @@ void handleNodes(HTTPRequest *req, HTTPResponse *res)
             out += jsonEscape(id);
             out += ",\"last_heard\":";
             out += jsonNum((int)tempNodeInfo->last_heard);
+            // Fall back to the node number for a node that has not sent its NodeInfo yet, so
+            // it is still identifiable rather than appearing as a blank row.
+            out += ",\"has_user\":";
+            out += hasUser ? "true" : "false";
             out += ",\"long_name\":";
-            out += jsonEscape(tempNodeInfo->long_name);
+            out += jsonEscape(hasUser ? tempNodeInfo->long_name : id);
             out += ",\"mac_address\":";
             out += jsonEscape("00:00:00:00:00:00");
             out += ",\"position\":";
             out += position;
             out += ",\"short_name\":";
-            out += jsonEscape(tempNodeInfo->short_name);
+            out += jsonEscape(hasUser ? tempNodeInfo->short_name : (id + 5));
             out += ",\"snr\":";
             out += jsonNum(tempNodeInfo->snr);
             out += ",\"via_mqtt\":";
             out += jsonEscape(BoolToString(nodeInfoLiteViaMqtt(tempNodeInfo)));
+
+            // Telemetry a node reported about itself. NodeInfoLite does not carry it - it is
+            // kept in a side map - so look it up rather than reading it off the entry.
+            out += ",\"hops_away\":";
+            out += tempNodeInfo->has_hops_away ? jsonNum((int)tempNodeInfo->hops_away) : "null";
+            out += ",\"role\":";
+            out += jsonNum((int)tempNodeInfo->role);
+            out += ",\"self\":";
+            out += (tempNodeInfo->num == nodeDB->getNodeNum()) ? "true" : "false";
+            auto metrics = nodeDB->nodeTelemetry.find(tempNodeInfo->num);
+            if (metrics != nodeDB->nodeTelemetry.end()) {
+                const meshtastic_DeviceMetrics &dm = metrics->second;
+                out += ",\"metrics\":{\"air_util_tx\":";
+                out += dm.has_air_util_tx ? jsonNum(dm.air_util_tx) : "null";
+                out += ",\"battery_level\":";
+                out += dm.has_battery_level ? jsonNum((int)dm.battery_level) : "null";
+                out += ",\"channel_utilization\":";
+                out += dm.has_channel_utilization ? jsonNum(dm.channel_utilization) : "null";
+                out += ",\"uptime_seconds\":";
+                out += dm.has_uptime_seconds ? jsonNum((int)dm.uptime_seconds) : "null";
+                out += ",\"voltage\":";
+                out += dm.has_voltage ? jsonNum(dm.voltage) : "null";
+                out += "}";
+            } else {
+                out += ",\"metrics\":null";
+            }
             out += "}";
         }
         tempNodeInfo = nodeDB->readNextMeshNode(readIndex);

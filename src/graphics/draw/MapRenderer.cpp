@@ -169,17 +169,20 @@ void MapRenderer::drawMapFrame(OLEDDisplay *display, OLEDDisplayUiState *state, 
     // origin itself, so the frame is still useful.
     const bool haveMap = BaseMap::begin();
 
-#if defined(SDCARD_EXCLUSIVE_WITH_BLUETOOTH)
-    // The card is not mounted while Bluetooth is on, so there are no maps. Say why, and
-    // say how to change it - a blank frame just looks broken.
-    if (!haveMap && config.bluetooth.enabled) {
+#if defined(SDCARD_EXCLUSIVE_WITH_BLE_WIFI)
+    // No map, no card, and a radio is up - so the radio is why. Name the one actually
+    // responsible: "turn off Bluetooth" is useless advice when it is Wi-Fi holding the
+    // card off. If the card did mount, this does not fire and any failure is about the
+    // file, not the radios.
+    if (!haveMap && !BaseMap::usingSdCard() && (config.bluetooth.enabled || config.network.wifi_enabled)) {
+        const bool wifi = config.network.wifi_enabled;
         graphics::drawCommonHeader(display, x, y, "MAP");
         display->setFont(FONT_SMALL);
         display->setTextAlignment(TEXT_ALIGN_CENTER);
         const int16_t line = FONT_HEIGHT_SMALL + 2;
         display->drawString(v.cx, v.cy - line - line / 2, "Maps unavailable");
-        display->drawString(v.cx, v.cy - line / 2, "while Bluetooth is on");
-        display->drawString(v.cx, v.cy + line / 2, "Menu > Bluetooth > Disabled");
+        display->drawString(v.cx, v.cy - line / 2, wifi ? "while Wi-Fi is on" : "while Bluetooth is on");
+        display->drawString(v.cx, v.cy + line / 2, wifi ? "Turn Wi-Fi off to use maps" : "Menu > Bluetooth > Disabled");
         display->setTextAlignment(TEXT_ALIGN_LEFT);
         return;
     }

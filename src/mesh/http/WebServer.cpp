@@ -19,8 +19,10 @@
 #endif // HAS_ETHERNET
 
 #ifdef ARCH_ESP32
+#include "esp_heap_caps.h"
 #include "esp_task_wdt.h"
 #endif
+#include <new> // std::nothrow - exceptions are disabled, so a throwing new aborts
 
 // Persistent Data Storage
 #include <Preferences.h>
@@ -62,6 +64,12 @@ static const uint8_t MAX_HTTPS_CONNECTIONS = 2;
 // Minimum free heap required for SSL handshake (~40KB for mbedTLS contexts)
 static const uint32_t MIN_HEAP_FOR_SSL = 40000;
 
+// MESHTASTIC_WEBSERVER_HTTP_ONLY drops the TLS half of the web server: no certificate, no
+// HTTPS listener, plain HTTP on port 80 only. Meant for memory-tight ESP32 boards where the
+// web UI is wanted on a trusted LAN and mbedtls' static tables, the TLS code and the
+// on-device RSA keygen are all unaffordable. Everything the web UI and the HTTP API do is
+// unchanged - only the encrypted listener goes away.
+#if !defined(MESHTASTIC_WEBSERVER_HTTP_ONLY)
 // HTTPSServer that can service and reap the connections it already holds without accepting new ones,
 // so a low-heap pause doesn't freeze open TLS sessions (and their heap) in place. Needs the protected table.
 class MeshHTTPSServer : public HTTPSServer
@@ -89,6 +97,10 @@ class MeshHTTPSServer : public HTTPSServer
 
 static SSLCert *cert;
 static MeshHTTPSServer *secureServer;
+#else
+// HTTP-only: nothing references the TLS types, so none of mbedtls gets linked in.
+static constexpr void *secureServer = nullptr;
+#endif
 static HTTPServer *insecureServer;
 
 volatile bool isWebServerReady;
@@ -99,6 +111,7 @@ static void handleWebResponse()
     if (isWifiAvailable()) {
 
         if (isWebServerReady) {
+#if !defined(MESHTASTIC_WEBSERVER_HTTP_ONLY)
             // Check heap before HTTPS processing - SSL requires significant memory
             if (secureServer) {
                 uint32_t freeHeap = ESP.getFreeHeap();
@@ -115,11 +128,19 @@ static void handleWebResponse()
                     }
                 }
             }
+#endif
             insecureServer->loop();
         }
     }
 }
 
+#if defined(MESHTASTIC_WEBSERVER_HTTP_ONLY)
+// No certificate to make. WiFiAPClient still calls this unconditionally.
+void createSSLCert()
+{
+    isCertReady = true;
+}
+#else
 static void taskCreateCert(void *parameter)
 {
     prefs.begin("MeshtasticHTTPS", false);
@@ -211,6 +232,7 @@ void createSSLCert()
         LOG_INFO("SSL Cert Ready");
     }
 }
+#endif // MESHTASTIC_WEBSERVER_HTTP_ONLY
 
 WebServerThread *webServerThread;
 
@@ -257,6 +279,27 @@ void initWebServer()
 {
     LOG_DEBUG("Init Web Server");
 
+#if defined(MESHTASTIC_WEBSERVER_HTTP_ONLY)
+    // new throws bad_alloc here when the card is mounted alongside Wi-Fi, and with C++
+    // exceptions disabled that is an immediate abort(). Log what is actually left: the
+    // "Free heap" line elsewhere reports MALLOC_CAP_INTERNAL, which counts 32-bit-only
+    // regions this allocation cannot use.
+    LOG_INFO("Web server pre-alloc: 8bit=%u largest8=%u internal=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    // nothrow: plain new THROWS bad_alloc, and with C++ exceptions disabled that is an
+    // immediate abort() - a boot loop rather than a missing feature. Measured on this
+    // board, the web server needs ~30 KB of 8-bit DRAM and the SD card takes almost
+    // exactly that, so this path is reachable whenever the card is mounted.
+    insecureServer = new (std::nothrow) HTTPServer();
+    if (!insecureServer) {
+        LOG_ERROR("Web server: only %u bytes of 8-bit DRAM free, not starting",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
+        return;
+    }
+    registerHandlers(insecureServer, nullptr);
+#else
     // We can now use the new certificate to setup our server as usual.
     secureServer = new MeshHTTPSServer(cert, 443, MAX_HTTPS_CONNECTIONS);
     insecureServer = new HTTPServer();
@@ -267,6 +310,7 @@ void initWebServer()
         LOG_INFO("Start Secure Web Server");
         secureServer->start();
     }
+#endif
     LOG_INFO("Start Insecure Web Server");
     insecureServer->start();
     if (insecureServer->isRunning()) {

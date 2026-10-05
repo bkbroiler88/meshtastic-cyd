@@ -22,6 +22,9 @@
 #include "modules/CannedMessageModule.h"
 #include <string>
 #include <vector>
+#ifdef ARCH_ESP32
+#include <esp_heap_caps.h>
+#endif
 
 // External declarations
 extern bool hasUnreadMessage;
@@ -514,7 +517,23 @@ void drawTextMessageFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16
     // rendering only ~5-30 lines at a time, caching more than this limit wastes heap. Stop
     // appending once we reach MAX_CACHED_LINES to prevent a single message from blowing out the
     // heap.
-    constexpr size_t MAX_CACHED_LINES = 100U; // ~5-6KB for std::string overhead on 32-bit (if each ~50-60 bytes avg)
+    size_t MAX_CACHED_LINES = 100U; // ~5-6KB for std::string overhead on 32-bit (if each ~50-60 bytes avg)
+#ifdef ARCH_ESP32
+    // ...but reserving that flat 100 is one contiguous ~3.2 KB allocation of std::string
+    // headers, and on a board where Bluetooth has taken most of the 8-bit DRAM it fails.
+    // operator new throws, nothing catches it, and std::terminate aborts the node mid-frame -
+    // it reads as "the display crashed when I changed frames". Total free heap is no guide
+    // here; only the largest contiguous 8-bit block can satisfy this, so ask for that and
+    // cache what actually fits. The screen shows a few tens of lines at most, so a smaller
+    // cache costs nothing visible.
+    {
+        constexpr size_t perLine = sizeof(std::string) + sizeof(AckStatus) + 1;
+        // Halve it: the strings themselves still have to allocate out of the same pool.
+        const size_t affordable = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / (perLine * 2);
+        if (affordable < MAX_CACHED_LINES)
+            MAX_CACHED_LINES = affordable < 8U ? 8U : affordable;
+    }
+#endif
     allLines.reserve(MAX_CACHED_LINES);
     isMine.reserve(MAX_CACHED_LINES);
     isHeader.reserve(MAX_CACHED_LINES);

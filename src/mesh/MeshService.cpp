@@ -51,7 +51,15 @@ the new node can build its node db)
 
 MeshService *service;
 
+// 16 of these is ~8 KB of .dram0.bss. In a build with MQTT compiled out the client proxy is
+// never driven, so every one of those slots is DRAM that can never be allocated from - and on
+// a board where Bluetooth and the display are already fighting over 8-bit DRAM that is real
+// money. Keep a single slot so every call site still compiles and the allocator still behaves.
+#if MESHTASTIC_EXCLUDE_MQTT
+#define MAX_MQTT_PROXY_MESSAGES 1
+#else
 #define MAX_MQTT_PROXY_MESSAGES 16
+#endif
 static MemoryPool<meshtastic_MqttClientProxyMessage, MAX_MQTT_PROXY_MESSAGES> staticMqttClientProxyMessagePool;
 
 #define MAX_QUEUE_STATUS 4

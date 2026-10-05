@@ -357,16 +357,10 @@ bool BaseMap::begin()
         return ok;
     inited = true;
 
-#if defined(SDCARD_EXCLUSIVE_WITH_BLUETOOTH)
-    // Maps are an SD-card feature, and the card is not mounted while Bluetooth is on -
-    // there is not enough 8-bit DRAM for both (see the gate in main.cpp). Report that
-    // plainly rather than quietly serving a stale internal copy; the map frame turns this
-    // into an on-screen explanation.
-    if (config.bluetooth.enabled) {
-        LOG_INFO("BaseMap: maps unavailable while Bluetooth is on (SD card not mounted)");
-        return false;
-    }
-#endif
+    // No radio policy here any more. main.cpp decides whether the card gets mounted; this
+    // just uses whatever is actually present - SD first, then internal flash. Duplicating
+    // the policy meant a second gate could refuse maps even after the card had mounted,
+    // which is exactly what happened when the two conditions drifted apart.
 
     // Prefer the SD card: it holds gigabytes, so the mapped area is not capped by the
     // 1 MB filesystem, and swapping regions is a file copy on a PC. Fall back to internal
@@ -437,6 +431,15 @@ bool BaseMap::begin()
 bool BaseMap::available()
 {
     return ok;
+}
+
+bool BaseMap::usingSdCard()
+{
+#if defined(BASEMAP_CAN_USE_SD)
+    return useSd;
+#else
+    return false;
+#endif
 }
 
 void BaseMap::beginFrame()

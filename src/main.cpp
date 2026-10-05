@@ -835,11 +835,11 @@ void setup()
     scannerToSensorsMap(i2cScanner, ScanI2C::DeviceType::MAX30102, meshtastic_TelemetrySensorType_MAX30102);
 #endif
 
-#if defined(HAS_SDCARD) && !defined(SDCARD_EXCLUSIVE_WITH_BLUETOOTH)
+#if defined(HAS_SDCARD) && !defined(SDCARD_EXCLUSIVE_WITH_BLE_WIFI)
     setupSDCard();
 #endif
-    // Boards that define SDCARD_EXCLUSIVE_WITH_BLUETOOTH mount the card later instead, once
-    // config is loaded - see the SD/Bluetooth gate after nodeDB is constructed.
+    // Boards that define SDCARD_EXCLUSIVE_WITH_BLE_WIFI mount the card later instead, once
+    // config is loaded - see the SD gate after nodeDB is constructed.
 
     // Hello
     printInfo();
@@ -875,7 +875,7 @@ void setup()
     esp32ReleaseBluetoothMemoryIfUnused();
 #endif
 
-#if defined(HAS_SDCARD) && defined(SDCARD_EXCLUSIVE_WITH_BLUETOOTH)
+#if defined(HAS_SDCARD) && defined(SDCARD_EXCLUSIVE_WITH_BLE_WIFI)
     // SD and Bluetooth are mutually exclusive on this board - there is not enough
     // 8-bit DRAM for both, and it is not close. Measured on the LCDWIKI 2.8 variant:
     //
@@ -889,16 +889,24 @@ void setup()
     // that point and is misleading: ~41 KB of it is IRAM handed to the heap, which can
     // never satisfy a byte-addressable allocation.
     //
-    // So the card follows Bluetooth: BLE off -> card mounted, the whole of it available
-    // for maps; BLE on -> card skipped and the map falls back to internal flash. This
+    // Wi-Fi is the same squeeze, and Meshtastic already makes Wi-Fi and BLE mutually
+    // exclusive on ESP32 (main-esp32.cpp: BLE only starts when Wi-Fi is unavailable), so
+    // gating on Bluetooth alone would quietly mount the card alongside Wi-Fi instead.
+    //
+    // So the card follows both: neither radio up -> card mounted and the whole of it is
+    // available for maps; either one up -> card skipped and the map frame says so. Maps
+    // are an offline feature, so a node on Wi-Fi is not the case that wants them. This
     // runs here rather than earlier in setup() because it needs config, which is only
     // loaded once nodeDB exists, immediately above.
-    if (!config.bluetooth.enabled) {
+    if (!config.bluetooth.enabled && !config.network.wifi_enabled) {
         const uint32_t before8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
         setupSDCard();
-        LOG_INFO("SD mounted (Bluetooth off): 8bit %u -> %u", before8, heap_caps_get_free_size(MALLOC_CAP_8BIT));
+        LOG_INFO("SD mounted (wifi=%d bt=%d): 8bit %u -> %u, largest8 now %u",
+                 (int)config.network.wifi_enabled, (int)config.bluetooth.enabled, before8,
+                 heap_caps_get_free_size(MALLOC_CAP_8BIT), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     } else {
-        LOG_INFO("SD skipped: Bluetooth is on and they cannot both fit in DRAM");
+        LOG_INFO("SD skipped: %s is on and they cannot both fit in DRAM",
+                 config.network.wifi_enabled ? "Wi-Fi" : "Bluetooth");
     }
 #endif
 

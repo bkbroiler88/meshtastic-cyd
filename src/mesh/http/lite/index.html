@@ -1,0 +1,765 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#67ea94">
+<title>Mesh Console</title>
+<style>
+/* Palette lifted from the Meshtastic web client rather than invented: brand green #67ea94
+   (the logo fill, the PWA theme-color), its --backgroundPrimary / --textPrimary /
+   --textSecondary / --link for both themes, and the Tailwind slate scale underneath them.
+   Dark is the default - this page is read in a shed, a truck or a field - but an explicit
+   light choice wins, and so does a light OS when nothing is stamped. */
+:root{
+  --bg:#0f172a;          /* slate-900, the client's dark --backgroundPrimary */
+  --panel:#1e293b;       /* slate-800 */
+  --panel-2:#172133;
+  --line:#334155;        /* slate-700 */
+  --ink:#ebebeb;         /* --textPrimary  */
+  --ink-dim:#bdbdbd;     /* --textSecondary */
+  --ink-faint:#94a3b8;   /* slate-400 */
+  --accent:#67ea94;      /* brand green */
+  --accent-ink:#0f172a;
+  --link:#8ec9ff;
+  --ok:#67ea94; --warn:#fbbf24; --bad:#f87171;
+  --mine:#2e544f;        /* brand green carried over the panel */
+  --r:7px;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;
+  /* Inter if the viewer happens to have it - the client's first choice - but never fetched:
+     this page is served by a node that may have no route to the internet. */
+  --sans:"Inter var",Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+:root[data-theme=light]{
+  --bg:#f1f5f9; --panel:#fff; --panel-2:#f8fafc; --line:#e2e8f0;
+  --ink:#111132; --ink-dim:#64748b; --ink-faint:#94a3b8;
+  --accent:#67ea94; --accent-ink:#0f172a; --link:#0b69bf;
+  --ok:#16a34a; --warn:#d97706; --bad:#dc2626;
+  --mine:#cdf3de;
+}
+@media (prefers-color-scheme:light){
+  :root:not([data-theme=dark]):not([data-theme=light]){
+    --bg:#f1f5f9; --panel:#fff; --panel-2:#f8fafc; --line:#e2e8f0;
+    --ink:#111132; --ink-dim:#64748b; --ink-faint:#94a3b8;
+    --accent:#67ea94; --accent-ink:#0f172a; --link:#0b69bf;
+    --ok:#16a34a; --warn:#d97706; --bad:#dc2626;
+    --mine:#cdf3de;
+  }
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.45 var(--sans);
+  -webkit-text-size-adjust:100%;
+  display:flex;flex-direction:column;height:100%;   /* composer stays put, the log scrolls */
+}
+button,input,select,textarea{font:inherit;color:inherit}
+
+/* ---- top bar ---------------------------------------------------------- */
+header{
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  padding:9px 12px;background:var(--panel);border-bottom:1px solid var(--line);
+}
+.badge{
+  font:600 13px/1 var(--mono);letter-spacing:.06em;
+  background:var(--accent);color:var(--accent-ink);
+  padding:6px 7px;border-radius:5px;white-space:nowrap;
+}
+.who{min-width:0;flex:1}
+.who b{display:block;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.who span{display:block;font:12px/1.3 var(--mono);color:var(--ink-faint)}
+.pulse{
+  width:8px;height:8px;border-radius:50%;background:var(--ok);flex:none;
+  box-shadow:0 0 0 0 var(--ok);
+}
+.pulse.on{animation:p 2.4s ease-out infinite}
+.pulse.off{background:var(--ink-faint);animation:none}
+.pulse.err{background:var(--bad);animation:none}
+@keyframes p{0%{box-shadow:0 0 0 0 rgba(103,234,148,.55)}70%{box-shadow:0 0 0 7px rgba(103,234,148,0)}100%{box-shadow:0 0 0 0 rgba(103,234,148,0)}}
+@media (prefers-reduced-motion:reduce){.pulse.on{animation:none}}
+.iconbtn{
+  background:var(--panel-2);border:1px solid var(--line);color:var(--ink-dim);
+  border-radius:5px;padding:5px 9px;cursor:pointer;font-size:13px;
+}
+.iconbtn:hover{color:var(--ink);border-color:var(--ink-faint)}
+
+/* ---- stat strip ------------------------------------------------------- */
+.stats{
+  display:flex;gap:0;overflow-x:auto;background:var(--panel-2);
+  border-bottom:1px solid var(--line);scrollbar-width:thin;
+}
+.stat{padding:7px 13px;border-right:1px solid var(--line);flex:none;min-width:84px}
+.stat i{
+  display:block;font:500 10px/1.3 var(--sans);font-style:normal;
+  letter-spacing:.09em;text-transform:uppercase;color:var(--ink-faint);
+}
+.stat b{font:600 15px/1.25 var(--mono);font-variant-numeric:tabular-nums}
+.stat b small{font-size:11px;font-weight:500;color:var(--ink-dim)}
+
+/* ---- layout ---------------------------------------------------------- */
+main{flex:1;min-height:0;display:grid;grid-template-columns:1fr}
+@media (min-width:860px){
+  main{grid-template-columns:minmax(0,1fr) 352px}
+}
+#metricpane{border-left:1px solid var(--line);background:var(--panel)}
+.pane{display:flex;flex-direction:column;min-height:0;min-width:0}
+/* An author display rule outranks the UA rule behind the hidden attribute, so say it here
+   or the phone layout stacks both panes instead of switching between them. */
+[hidden]{display:none!important}
+#nodepane{border-left:1px solid var(--line);background:var(--panel)}
+.panehead{
+  display:flex;align-items:baseline;gap:8px;padding:8px 12px;
+  border-bottom:1px solid var(--line);
+}
+.panehead h2{
+  margin:0;font:600 11px/1 var(--sans);letter-spacing:.11em;
+  text-transform:uppercase;color:var(--ink-dim);
+}
+.panehead em{font-style:normal;font:12px/1 var(--mono);color:var(--ink-faint);margin-left:auto}
+.filter{display:flex;gap:4px}
+.filter button{
+  background:none;border:1px solid transparent;border-radius:4px;cursor:pointer;
+  padding:3px 7px;color:var(--ink-faint);font:11px/1 var(--sans);
+}
+.filter button[aria-pressed=true]{color:var(--ink);border-color:var(--line);background:var(--panel-2)}
+.chip.dm{border-color:var(--accent);color:var(--accent)}
+.node.stranger .nm b{color:var(--ink-faint);font-family:var(--mono);font-size:13px}
+
+/* phone: tabs */
+nav.tabs{display:flex;border-bottom:1px solid var(--line);background:var(--panel)}
+nav.tabs button{
+  flex:1;background:none;border:0;border-bottom:2px solid transparent;
+  padding:10px;color:var(--ink-dim);cursor:pointer;
+  font:600 11px/1 var(--sans);letter-spacing:.11em;text-transform:uppercase;
+}
+nav.tabs button[aria-selected=true]{color:var(--ink);border-bottom-color:var(--accent)}
+/* Wide keeps the bar - it is what switches the right column between nodes and metrics -
+   but drops Messages, which is on screen there regardless. */
+@media (min-width:860px){
+  nav.tabs{justify-content:flex-end}
+  nav.tabs button{flex:none;padding:8px 20px}
+  #tabMsg{display:none}
+}
+
+/* ---- message log ----------------------------------------------------- */
+#log{flex:1;overflow-y:auto;padding:10px 12px;display:flex;flex-direction:column;gap:9px}
+.msg{display:flex;gap:9px;align-items:flex-start}
+.msg .av{
+  flex:none;width:34px;height:34px;border-radius:6px;background:var(--panel-2);
+  border:1px solid var(--line);display:grid;place-items:center;
+  font:600 11px/1 var(--mono);color:var(--ink-dim);
+}
+.bubble{
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--r);
+  padding:7px 10px;max-width:min(640px,86%);min-width:0;
+}
+.msg.mine{flex-direction:row-reverse}
+.msg.mine .bubble{background:var(--mine);border-color:transparent}
+.meta{
+  display:flex;gap:7px;flex-wrap:wrap;align-items:baseline;
+  font:11px/1.3 var(--sans);color:var(--ink-faint);margin-bottom:2px;
+}
+.meta b{font-weight:600;color:var(--ink-dim)}
+.meta code{font:11px/1.3 var(--mono)}
+.txt{white-space:pre-wrap;overflow-wrap:anywhere}
+.chip{
+  font:10px/1 var(--mono);letter-spacing:.04em;padding:3px 5px;border-radius:4px;
+  background:var(--panel-2);border:1px solid var(--line);color:var(--ink-dim);
+}
+.empty{margin:auto;text-align:center;color:var(--ink-faint);font-size:13px;padding:24px}
+
+/* ---- composer -------------------------------------------------------- */
+form.compose{
+  border-top:1px solid var(--line);background:var(--panel);
+  padding:9px 12px;display:grid;gap:8px;
+  grid-template-columns:1fr 1fr;grid-template-areas:"ch to" "msg msg";
+}
+@media (min-width:620px){
+  form.compose{grid-template-columns:auto auto 1fr;grid-template-areas:"ch to msg"}
+}
+form.compose select{width:auto;min-width:104px}
+select,input[type=text]{
+  background:var(--panel-2);border:1px solid var(--line);border-radius:5px;
+  padding:8px 9px;min-width:0;width:100%;
+}
+.sendrow{grid-area:msg;display:flex;gap:8px;min-width:0}
+.sendrow input{flex:1}
+button.send{
+  background:var(--accent);color:var(--accent-ink);border:0;border-radius:5px;
+  padding:8px 15px;font-weight:600;cursor:pointer;white-space:nowrap;
+}
+button.send:disabled{opacity:.45;cursor:default}
+.count{font:11px/1 var(--mono);color:var(--ink-faint);align-self:center}
+:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+
+/* ---- node list ------------------------------------------------------- */
+#nodes{flex:1;overflow-y:auto}
+.node{
+  display:grid;grid-template-columns:34px 1fr auto;gap:9px;align-items:center;
+  padding:8px 12px;border-bottom:1px solid var(--line);
+}
+.node .nm{min-width:0}
+.node .nm b{display:block;font-weight:500;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.node .nm span{font:11px/1.3 var(--mono);color:var(--ink-faint)}
+.node.self{background:var(--panel-2)}
+.right{text-align:right;font:11px/1.35 var(--mono);color:var(--ink-faint);font-variant-numeric:tabular-nums}
+.bars{display:inline-flex;gap:2px;align-items:flex-end;height:11px;vertical-align:-1px}
+.bars i{width:3px;background:var(--ink-faint);border-radius:1px;opacity:.28}
+.bars i:nth-child(1){height:4px}.bars i:nth-child(2){height:6px}
+.bars i:nth-child(3){height:9px}.bars i:nth-child(4){height:11px}
+.bars.s1 i:nth-child(-n+1),.bars.s2 i:nth-child(-n+2),
+.bars.s3 i:nth-child(-n+3),.bars.s4 i:nth-child(-n+4){background:var(--ok);opacity:1}
+.bars.s1 i:nth-child(-n+1){background:var(--bad)}
+.bars.s2 i:nth-child(-n+2){background:var(--warn)}
+/* ---- metrics ---------------------------------------------------------- */
+#metrics{flex:1;overflow-y:auto;padding:4px 0 12px}
+.mblock{padding:10px 12px;border-bottom:1px solid var(--line)}
+.mblock h3{
+  margin:0 0 8px;font:600 10px/1 var(--sans);letter-spacing:.11em;
+  text-transform:uppercase;color:var(--ink-faint);
+}
+#chart svg{display:block;width:100%;height:auto;overflow:visible}
+.legend{display:flex;gap:12px;margin:7px 0 0;font:11px/1 var(--sans);color:var(--ink-dim)}
+.legend span{display:flex;align-items:center;gap:4px}
+.legend i{width:9px;height:9px;border-radius:2px;display:inline-block}
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:7px}
+.tile{background:var(--panel-2);border:1px solid var(--line);border-radius:5px;padding:6px 8px}
+.tile i{
+  display:block;font:500 10px/1.3 var(--sans);font-style:normal;letter-spacing:.07em;
+  text-transform:uppercase;color:var(--ink-faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.tile b{font:600 14px/1.3 var(--mono);font-variant-numeric:tabular-nums}
+.tile b small{font-size:10px;font-weight:500;color:var(--ink-dim)}
+footer{
+  padding:6px 12px;border-top:1px solid var(--line);
+  font:11px/1.4 var(--mono);color:var(--ink-faint);
+  display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;
+}
+footer a{color:var(--ink-faint)}
+</style>
+</head>
+<body>
+
+<header>
+  <span class="badge" id="meShort">····</span>
+  <span class="who"><b id="meLong">Connecting…</b><span id="meId">—</span></span>
+  <span class="pulse off" id="pulse" title="poll status"></span>
+  <button class="iconbtn" id="pause" title="pause polling">pause</button>
+  <button class="iconbtn" id="theme" title="light / dark">◑</button>
+</header>
+
+<div class="stats" id="stats"></div>
+
+<nav class="tabs">
+  <button id="tabMsg" aria-selected="true">Messages</button>
+  <button id="tabNode" aria-selected="false">Nodes <span id="nodeCount"></span></button>
+  <button id="tabMetric" aria-selected="false">Metrics</button>
+</nav>
+
+<main>
+  <section class="pane" id="msgpane">
+    <div class="panehead">
+      <h2>Messages</h2>
+      <span class="filter" id="filter">
+        <button data-f="all" aria-pressed="true">All</button>
+        <button data-f="bcast" aria-pressed="false">Channel</button>
+        <button data-f="dm" aria-pressed="false">DMs</button>
+      </span>
+      <em id="msgInfo"></em>
+    </div>
+    <div id="log"><div class="empty">No messages yet.</div></div>
+    <form class="compose" id="compose" autocomplete="off">
+      <select id="ch" title="channel"></select>
+      <select id="to" title="destination"><option value="4294967295">Everyone</option></select>
+      <div class="sendrow">
+        <input type="text" id="msg" maxlength="200" placeholder="Message the mesh…">
+        <span class="count" id="count"></span>
+        <button class="send" id="sendBtn" type="submit">Send</button>
+      </div>
+    </form>
+  </section>
+
+  <aside class="pane" id="nodepane" hidden>
+    <div class="panehead"><h2>Nodes</h2><em id="nodeInfo"></em></div>
+    <div id="nodes"></div>
+    <footer>
+      <span id="fwLine">—</span>
+      <span id="radioLine">—</span>
+    </footer>
+  </aside>
+
+  <aside class="pane" id="metricpane" hidden>
+    <div class="panehead"><h2>Metrics</h2><em id="metricInfo"></em></div>
+    <div id="metrics">
+      <section class="mblock">
+        <h3>Airtime, last 8 hours</h3>
+        <div id="chart"></div>
+        <p class="legend">
+          <span><i style="background:var(--accent)"></i>TX</span>
+          <span><i style="background:var(--link)"></i>RX</span>
+          <span><i style="background:var(--warn)"></i>unparsed</span>
+        </p>
+      </section>
+      <section class="mblock"><h3>This node</h3><div class="tiles" id="selfTiles"></div></section>
+      <section class="mblock"><h3>Mesh</h3><div class="tiles" id="meshTiles"></div></section>
+    </div>
+  </aside>
+</main>
+
+<script>
+"use strict";
+/* ---------- tiny helpers ------------------------------------------------ */
+const $ = s => document.querySelector(s);
+const el = (t, c, txt) => { const n = document.createElement(t); if (c) n.className = c; if (txt != null) n.textContent = txt; return n; };
+const BCAST = 4294967295;
+
+function ago(sec) {
+  if (!sec) return "never";
+  const d = Math.max(0, Math.floor(Date.now() / 1000) - sec);
+  if (d < 60) return d + "s";
+  if (d < 3600) return Math.floor(d / 60) + "m";
+  if (d < 86400) return Math.floor(d / 3600) + "h";
+  return Math.floor(d / 86400) + "d";
+}
+function clock(sec) {
+  if (!sec) return "";
+  const t = new Date(sec * 1000);
+  return String(t.getHours()).padStart(2, "0") + ":" + String(t.getMinutes()).padStart(2, "0");
+}
+function dur(sec) {
+  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
+  return d ? d + "d " + h + "h" : h ? h + "h " + m + "m" : m + "m";
+}
+// SNR to 0..4 bars. Thresholds follow what the LoRa link actually tolerates,
+// not a linear scale: below -17 dB the demodulator is at its floor.
+const bars = snr => snr >= 2 ? 4 : snr >= -7 ? 3 : snr >= -14 ? 2 : snr > -100 ? 1 : 0;
+
+/* ---------- transport --------------------------------------------------- */
+/* The page is served by the node it talks to, so there is no connection to
+   configure: every request is relative to wherever this page came from. */
+let failures = 0;
+async function api(path, body) {
+  const opt = body
+    ? { method: "POST", body, headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+    : {};
+  const r = await fetch(path, opt);
+  if (!r.ok) throw new Error(path + " -> " + r.status);
+  return r.json();
+}
+
+/* MOCK — stripped by tools/gen_assets.py when packing for flash. */
+/*MOCK*/
+// On the device this page always arrives over http, so anything else - file://, data://,
+// a preview pane - is someone looking at the mockup.
+const MOCK = !location.protocol.startsWith("http") || location.search.includes("mock");
+if (MOCK) {
+  const t = () => Math.floor(Date.now() / 1000);
+  const met = (b, v, cu, tx, up) => ({ battery_level: b, voltage: v, channel_utilization: cu, air_util_tx: tx, uptime_seconds: up });
+  const nodes = [
+    { id: "!2b643064", long_name: "Hale Base", short_name: "HALE", snr: 0, last_heard: t() - 4, hops_away: 0, self: true, role: 3, metrics: met(101, 4.19, 4.8, .9, 191520), position: { latitude: 39.4193, longitude: -76.2944, altitude: 28 } },
+    { id: "!a41c88f0", long_name: "Edgewood Relay", short_name: "EDGE", snr: 8.5, last_heard: t() - 41, hops_away: 0, role: 2, metrics: met(94, 4.02, 5.1, 1.2, 884300), position: { latitude: 39.4411, longitude: -76.3062, altitude: 61 } },
+    { id: "!7d20e114", long_name: "Tower Seven", short_name: "TW07", snr: -6.25, last_heard: t() - 380, hops_away: 1, role: 4, metrics: met(71, 3.86, 4.4, .6, 420000), position: { latitude: 39.4028, longitude: -76.2515, altitude: 140 } },
+    { id: "!19aa4c03", long_name: "Pickup Mobile", short_name: "TRUK", snr: -15.5, last_heard: t() - 1140, hops_away: 2, role: 5, metrics: met(48, 3.71, null, null, 6200), position: null },
+    { id: "!c0ffee42", long_name: "Shed Sensor", short_name: "SHED", snr: -11, last_heard: t() - 7400, hops_away: 1, role: 6, metrics: met(12, 3.42, 3.9, .2, 2600000), position: { latitude: 39.4201, longitude: -76.2951, altitude: 25 } },
+    // heard, but has not sent a NodeInfo yet
+    { id: "!5f10bb28", long_name: "!5f10bb28", short_name: "bb28", has_user: false, snr: -3.25, last_heard: t() - 95, hops_away: 1, metrics: null, position: null }
+  ];
+  nodes.forEach(n => { if (n.has_user === undefined) n.has_user = true; });
+  const msgs = [
+    { id: 1, from: "!a41c88f0", channel: 0, rx_time: t() - 2600, snr: 9, hops: 0, text: "Relay back up after the storm, antenna is retuned." },
+    { id: 2, from: "!2b643064", channel: 0, rx_time: t() - 2400, snr: 0, hops: 0, text: "Copy that. Running 22 dBm here.", outgoing: true },
+    { id: 3, from: "!7d20e114", channel: 0, rx_time: t() - 900, snr: -6.25, hops: 1, text: "Tower seven hearing you at -6. Two hops through EDGE." },
+    { id: 4, from: "!19aa4c03", channel: 2, rx_time: t() - 240, snr: -15.5, hops: 2, text: "Mobile, heading north on 40. Signal getting thin." },
+    { id: 5, from: "!a41c88f0", to: "!2b643064", dm: true, channel: 0, rx_time: t() - 180, snr: 8.5, hops: 0, text: "Direct: can you take the 2m net tonight?" },
+    { id: 6, from: "!2b643064", to: "!a41c88f0", dm: true, outgoing: true, channel: 0, rx_time: t() - 150, snr: 0, hops: 0, text: "Direct: yes, 2000 local." },
+    { id: 7, from: "!c0ffee42", channel: 0, rx_time: t() - 70, snr: -11, hops: 1, text: "Battery 12% — switching to one report an hour." }
+  ];
+  msgs.forEach(m => { if (!m.to) { m.to = "!ffffffff"; m.dm = false; } });
+  const report = {
+    data: {
+      node: {
+        id: "!2b643064", num: 727445604, long_name: "Hale Base", short_name: "HALE",
+        firmware: "2.7.11.lite", role: 3,
+        channels: [{ index: 0, name: "LongFast", role: 1 }, { index: 1, name: "", role: 2 },
+        { index: 2, name: "Shed", role: 2 }, { index: 3, name: "", role: 0 }]
+      },
+      airtime: {
+        channel_utilization: 4.8, utilization_tx: 0.9, seconds_since_boot: 191520,
+        periods_to_log: 8, seconds_per_period: 3600,
+        // raw ms of airtime in each of the last 8 hours, newest first
+        tx_log: [91000, 302000, 268000, 410000, 155000, 88000, 121000, 96000],
+        rx_log: [412000, 980000, 1140000, 1620000, 760000, 390000, 455000, 501000],
+        rx_all_log: [120000, 260000, 310000, 505000, 198000, 102000, 134000, 149000]
+      },
+      memory: { heap_free: 117448, heap_total: 294912, fs_free: 823296, fs_total: 1048576 },
+      power: { battery_percent: 100, battery_voltage_mv: 4190, has_battery: "true", is_charging: "true", has_usb: "true" },
+      radio: { frequency: 906.875, lora_channel: 20 },
+      wifi: { ip: "10.1.10.225", rssi: -58 },
+      device: { reboot_counter: 6 }
+    }, status: "ok"
+  };
+  let nextId = 6;
+  window.__api = async (path, body) => {
+    await new Promise(r => setTimeout(r, 90));
+    if (path.startsWith("/json/report")) return report;
+    if (path.startsWith("/json/nodes")) return { data: { nodes }, status: "ok" };
+    if (path.startsWith("/json/messages")) return { data: { messages: msgs, now: t() }, status: "ok" };
+    if (path.startsWith("/json/send")) {
+      const p = new URLSearchParams(body);
+      const to = p.get("to") || "!ffffffff";
+      msgs.push({
+        id: nextId++, from: "!2b643064", to, dm: to !== "4294967295" && to !== "!ffffffff",
+        channel: +p.get("ch"), rx_time: t(), snr: 0, hops: 0, text: p.get("msg"), outgoing: true
+      });
+      return { status: "ok" };
+    }
+    throw new Error("mock 404 " + path);
+  };
+}
+/*ENDMOCK*/
+
+const call = (p, b) => (window.__api ? window.__api(p, b) : api(p, b));
+
+/* ---------- state ------------------------------------------------------ */
+const S = { me: null, nodes: [], byId: {}, msgs: [], chans: [], paused: false, tick: 0, filter: "all" };
+
+/* ---------- render: stats ---------------------------------------------- */
+function statsView(d) {
+  const S_ = [];
+  const p = d.power || {}, a = d.airtime || {}, m = d.memory || {}, w = d.wifi || {}, r = d.radio || {};
+  if (p.has_battery === "true")
+    S_.push(["battery", p.battery_percent + "%", (p.battery_voltage_mv / 1000).toFixed(2) + "V" + (p.is_charging === "true" ? " chg" : "")]);
+  else if (p.has_usb === "true") S_.push(["power", "USB", ""]);
+  S_.push(["ch util", (+a.channel_utilization).toFixed(1) + "%", ""]);
+  S_.push(["air tx", (+a.utilization_tx).toFixed(1) + "%", ""]);
+  S_.push(["uptime", dur(a.seconds_since_boot || 0), ""]);
+  if (w.ip) S_.push(["wifi", w.rssi + "", "dBm"]);
+  S_.push(["heap", Math.round((m.heap_free || 0) / 1024) + "", "KB"]);
+  if (r.frequency) S_.push(["freq", (+r.frequency).toFixed(3), "MHz"]);
+
+  const box = $("#stats"); box.textContent = "";
+  for (const [label, val, sub] of S_) {
+    const s = el("div", "stat"); s.appendChild(el("i", null, label));
+    const b = el("b", null, val);
+    if (sub) { const sm = el("small", null, " " + sub); b.appendChild(sm); }
+    s.appendChild(b); box.appendChild(s);
+  }
+}
+
+/* ---------- render: messages ------------------------------------------- */
+function name(id) { const n = S.byId[id]; return n ? n.long_name : id; }
+function short(id) { const n = S.byId[id]; return n ? n.short_name : (id || "").slice(-4); }
+
+function msgView() {
+  const log = $("#log");
+  const stuck = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  log.textContent = "";
+  const shown = S.msgs.filter(m => S.filter === "all" || (S.filter === "dm" ? m.dm : !m.dm));
+  if (!shown.length) {
+    log.appendChild(el("div", "empty", S.msgs.length
+      ? "No " + (S.filter === "dm" ? "direct messages" : "channel messages") + " in the buffer."
+      : "No messages yet."));
+    $("#msgInfo").textContent = S.msgs.length + " kept";
+    return;
+  }
+  for (const m of shown) {
+    const row = el("div", "msg" + (m.outgoing ? " mine" : ""));
+    row.appendChild(el("div", "av", short(m.from)));
+    const b = el("div", "bubble");
+    const meta = el("div", "meta");
+    meta.appendChild(el("b", null, m.outgoing ? "You" : name(m.from)));
+    meta.appendChild(el("code", null, clock(m.rx_time)));
+    if (m.dm) {
+      // A DM is addressed to one node, so say which rather than showing a channel it did
+      // not really travel on.
+      meta.appendChild(el("span", "chip dm", m.outgoing ? "DM to " + short(m.to) : "DM"));
+    } else {
+      const c = S.chans.find(c => c.index === m.channel);
+      const chName = (c && c.name) || "Ch " + m.channel;
+      meta.appendChild(el("span", "chip", chName));
+    }
+    if (!m.outgoing) {
+      meta.appendChild(el("span", null, m.snr + " dB"));
+      if (m.hops) meta.appendChild(el("span", null, m.hops + (m.hops > 1 ? " hops" : " hop")));
+    }
+    b.appendChild(meta);
+    b.appendChild(el("div", "txt", m.text));
+    row.appendChild(b);
+    log.appendChild(row);
+  }
+  if (stuck) log.scrollTop = log.scrollHeight;
+  $("#msgInfo").textContent = (shown.length === S.msgs.length)
+    ? S.msgs.length + " kept" : shown.length + " of " + S.msgs.length;
+}
+
+/* ---------- render: nodes ---------------------------------------------- */
+function nodeView() {
+  const box = $("#nodes"); box.textContent = "";
+  const list = S.nodes.slice().sort((a, b) => (b.last_heard || 0) - (a.last_heard || 0));
+  for (const n of list) {
+    // has_user false = heard on the air but it has not sent a NodeInfo yet, so it shows as
+    // its node number until it introduces itself.
+    const row = el("div", "node" + (n.self ? " self" : "") + (n.has_user === false ? " stranger" : ""));
+    row.appendChild(el("div", "av", n.short_name || "····"));
+    const nm = el("div", "nm");
+    nm.appendChild(el("b", null, n.long_name || n.id));
+    const sub = el("span", null, n.id + (n.position ? "  " + n.position.latitude.toFixed(4) + ", " + n.position.longitude.toFixed(4) : ""));
+    nm.appendChild(sub);
+    row.appendChild(nm);
+
+    const right = el("div", "right");
+    if (n.self) { right.textContent = "this node"; }
+    else {
+      const bb = el("span", "bars s" + bars(n.snr));
+      for (let i = 0; i < 4; i++) bb.appendChild(el("i"));
+      right.appendChild(bb);
+      right.appendChild(document.createTextNode(" " + n.snr + "dB"));
+      const bits = [ago(n.last_heard)];
+      if (n.hops_away) bits.push(n.hops_away + "h");
+      const b = n.metrics && n.metrics.battery_level;
+      if (b != null) bits.push(b > 100 ? "pwr" : b + "%");   // >100 means mains-powered
+      right.appendChild(el("div", null, bits.join(" · ")));
+    }
+    row.appendChild(right);
+    box.appendChild(row);
+  }
+  const txt = list.length + (list.length === 1 ? " node" : " nodes");
+  $("#nodeInfo").textContent = txt;
+  $("#nodeCount").textContent = "(" + list.length + ")";
+}
+
+/* ---------- render: metrics -------------------------------------------- */
+const ROLES = ["CLIENT", "CLIENT_MUTE", "ROUTER", "ROUTER_CLIENT", "REPEATER", "TRACKER", "SENSOR",
+  "TAK", "CLIENT_HIDDEN", "LOST_AND_FOUND", "TAK_TRACKER", "ROUTER_LATE", "CLIENT_BASE"];
+
+/* airtimeReport() hands back raw milliseconds of airtime per hour-long period, so a period
+   is (ms / 3600000) busy. The newest period is still filling, which is why it is drawn
+   faded rather than scaled up to a full hour - normalising two minutes of data to an hour
+   would invent a number. */
+function chart(a) {
+  const n = Math.min(a.periods_to_log || 0, (a.tx_log || []).length);
+  if (!n) return "";
+  const perMs = (a.seconds_per_period || 3600) * 1000;
+  const pct = (arr, i) => Math.max(0, (arr && arr[i] ? arr[i] : 0) / perMs * 100);
+
+  const W = 340, H = 118, PAD_L = 26, PAD_B = 16, PAD_T = 6;
+  const plotW = W - PAD_L, plotH = H - PAD_B - PAD_T;
+  const totals = [];
+  for (let i = 0; i < n; i++) totals.push(pct(a.tx_log, i) + pct(a.rx_log, i) + pct(a.rx_all_log, i));
+  // Round the axis to something readable rather than to the exact peak
+  const peak = Math.max(...totals, 1);
+  const step = peak <= 5 ? 1 : peak <= 20 ? 5 : peak <= 50 ? 10 : 25;
+  const top = Math.ceil(peak / step) * step;
+
+  const gap = plotW / n, bw = gap * 0.68;
+  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Airtime utilisation per hour">`;
+  for (let g = 0; g <= top; g += step) {
+    const y = PAD_T + plotH - (g / top) * plotH;
+    s += `<line x1="${PAD_L}" y1="${y}" x2="${W}" y2="${y}" stroke="var(--line)" stroke-width="1"/>`
+      + `<text x="${PAD_L - 4}" y="${y + 3}" text-anchor="end" font-size="8" fill="var(--ink-faint)">${g}%</text>`;
+  }
+  // Index 0 is the newest period, so draw right to left and put "now" at the right edge
+  for (let i = 0; i < n; i++) {
+    const x = PAD_L + (n - 1 - i) * gap + (gap - bw) / 2;
+    let y = PAD_T + plotH;
+    const parts = [[pct(a.rx_all_log, i), "var(--warn)"], [pct(a.rx_log, i), "var(--link)"],
+    [pct(a.tx_log, i), "var(--accent)"]];
+    for (const [v, fill] of parts) {
+      const h = (v / top) * plotH;
+      if (h > 0.4) {
+        y -= h;
+        s += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}"`
+          + ` height="${h.toFixed(1)}" fill="${fill}" opacity="${i === 0 ? .45 : 1}"/>`;
+      }
+    }
+    s += `<text x="${(x + bw / 2).toFixed(1)}" y="${H - 4}" text-anchor="middle" font-size="8"`
+      + ` fill="var(--ink-faint)">${i === 0 ? "now" : "-" + i + "h"}</text>`;
+  }
+  return s + "</svg>";
+}
+
+function tiles(box, rows) {
+  box.textContent = "";
+  for (const [label, val, sub] of rows) {
+    if (val == null || val === "") continue;
+    const t = el("div", "tile");
+    t.appendChild(el("i", null, label));
+    const b = el("b", null, String(val));
+    if (sub) b.appendChild(el("small", null, " " + sub));
+    t.appendChild(b);
+    box.appendChild(t);
+  }
+}
+
+function metricsView(d) {
+  $("#chart").innerHTML = chart(d.airtime || {});
+
+  const p = d.power || {}, m = d.memory || {}, w = d.wifi || {}, r = d.radio || {}, a = d.airtime || {};
+  tiles($("#selfTiles"), [
+    ["role", d.node ? (ROLES[d.node.role] || d.node.role) : null],
+    ["battery", p.has_battery === "true" ? p.battery_percent + "%" : (p.has_usb === "true" ? "USB" : null)],
+    ["voltage", p.battery_voltage_mv ? (p.battery_voltage_mv / 1000).toFixed(2) : null, "V"],
+    ["charging", p.has_battery === "true" ? (p.is_charging === "true" ? "yes" : "no") : null],
+    ["ch util", (+a.channel_utilization).toFixed(1), "%"],
+    ["air tx", (+a.utilization_tx).toFixed(1), "%"],
+    ["uptime", dur(a.seconds_since_boot || 0)],
+    ["reboots", d.device ? d.device.reboot_counter : null],
+    ["heap free", Math.round((m.heap_free || 0) / 1024), "KB"],
+    ["heap total", Math.round((m.heap_total || 0) / 1024), "KB"],
+    ["fs used", Math.round((m.fs_used || 0) / 1024), "KB"],
+    ["wifi rssi", w.rssi, "dBm"],
+    ["ip", w.ip],
+    ["frequency", (+r.frequency).toFixed(3), "MHz"],
+    ["lora ch", r.lora_channel]
+  ]);
+
+  // Mesh-wide figures are derived here, not on the node: the client already holds the whole
+  // node list, and the node has better uses for its DRAM.
+  const now = Math.floor(Date.now() / 1000);
+  const others = S.nodes.filter(n => !n.self);
+  const heard = s => others.filter(n => n.last_heard && now - n.last_heard < s).length;
+  const direct = others.filter(n => n.hops_away === 0).length;
+  const snrs = others.filter(n => n.snr > -100).map(n => n.snr);
+  const batts = others.map(n => n.metrics && n.metrics.battery_level).filter(b => b != null && b <= 100);
+  tiles($("#meshTiles"), [
+    ["nodes", others.length],
+    ["heard 1h", heard(3600)],
+    ["heard 24h", heard(86400)],
+    ["direct", direct],
+    ["via relay", others.length - direct],
+    ["best snr", snrs.length ? Math.max(...snrs).toFixed(1) : null, "dB"],
+    ["worst snr", snrs.length ? Math.min(...snrs).toFixed(1) : null, "dB"],
+    ["lowest batt", batts.length ? Math.min(...batts) : null, "%"]
+  ]);
+  $("#metricInfo").textContent = "at " + clock(now);
+}
+
+/* ---------- selects ---------------------------------------------------- */
+function fillSelects() {
+  const ch = $("#ch"), want = ch.value;
+  ch.textContent = "";
+  // role 0 = DISABLED, 1 = PRIMARY, 2 = SECONDARY. An unnamed secondary is still a usable
+  // channel, so offer it by index rather than skipping it for having no name.
+  for (const c of S.chans) {
+    if (!c.role) continue;
+    const label = c.name || (c.role === 1 ? "Primary" : "Ch " + c.index);
+    ch.appendChild(el("option", null, label)).value = c.index;
+  }
+  if (!ch.options.length) ch.appendChild(el("option", null, "Primary")).value = 0;
+  if (want) ch.value = want;
+
+  const to = $("#to"), wantTo = to.value;
+  to.textContent = "";
+  to.appendChild(el("option", null, "Everyone")).value = BCAST;
+  for (const n of S.nodes) {
+    if (n.self) continue;
+    to.appendChild(el("option", null, n.short_name + " · " + n.long_name)).value = n.id;
+  }
+  if (wantTo) to.value = wantTo;
+}
+
+/* ---------- polling ---------------------------------------------------- */
+function pulse(state) { $("#pulse").className = "pulse " + state; }
+
+async function poll() {
+  if (S.paused) return;
+  try {
+    const mr = await call("/json/messages");
+    S.msgs = mr.data.messages; msgView();
+    if (S.tick % 4 === 0) {                     // node list and status change slowly
+      const nr = await call("/json/nodes");
+      S.nodes = nr.data.nodes;
+      S.byId = {}; for (const n of S.nodes) S.byId[n.id] = n;
+      nodeView();
+      const rr = await call("/json/report");
+      const d = rr.data; S.me = d.node; S.chans = d.node.channels || [];
+      // Both selects need the node list AND the channel names, so fill them here; and the
+      // log drew before either arrived, so names and avatars need a second pass.
+      fillSelects(); msgView();
+      $("#meShort").textContent = d.node.short_name;
+      $("#meLong").textContent = d.node.long_name;
+      $("#meId").textContent = d.node.id + " · " + (ROLES[d.node.role] || d.node.role);
+      $("#fwLine").textContent = "fw " + d.node.firmware;
+      $("#radioLine").textContent = (+d.radio.frequency).toFixed(3) + " MHz · ch " + d.radio.lora_channel;
+      document.title = d.node.short_name + " · Mesh Console";
+      statsView(d);
+      metricsView(d);
+    }
+    S.tick++; failures = 0; pulse("on");
+  } catch (e) {
+    pulse(++failures > 2 ? "err" : "on");
+  }
+}
+
+let timer = null;
+function loop() { clearTimeout(timer); poll().finally(() => { timer = setTimeout(loop, 3000); }); }
+
+/* ---------- actions --------------------------------------------------- */
+$("#compose").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const input = $("#msg"), text = input.value.trim();
+  if (!text) return;
+  const btn = $("#sendBtn"); btn.disabled = true;
+  try {
+    const body = new URLSearchParams({ ch: $("#ch").value, to: $("#to").value, msg: text });
+    await call("/json/send", body.toString());
+    input.value = ""; $("#count").textContent = "";
+    loop();                                     // show it without waiting for the next tick
+  } catch (e) {
+    btn.textContent = "failed";
+    setTimeout(() => { btn.textContent = "Send"; }, 1600);
+  } finally { btn.disabled = false; input.focus(); }
+});
+
+$("#filter").addEventListener("click", ev => {
+  const btn = ev.target.closest("button");
+  if (!btn) return;
+  S.filter = btn.dataset.f;
+  for (const b of $("#filter").children) b.setAttribute("aria-pressed", String(b === btn));
+  msgView();
+});
+
+$("#msg").addEventListener("input", e => {
+  const n = e.target.value.length;
+  $("#count").textContent = n > 140 ? (200 - n) + "" : "";
+});
+
+$("#pause").addEventListener("click", () => {
+  S.paused = !S.paused;
+  $("#pause").textContent = S.paused ? "resume" : "pause";
+  pulse(S.paused ? "off" : "on");
+  if (!S.paused) loop();
+});
+
+$("#theme").addEventListener("click", () => {
+  const cur = document.documentElement.getAttribute("data-theme");
+  document.documentElement.setAttribute("data-theme", cur === "light" ? "dark" : "light");
+  try { localStorage.setItem("mc-theme", cur === "light" ? "dark" : "light"); } catch (e) {}
+});
+try { const t = localStorage.getItem("mc-theme"); if (t) document.documentElement.setAttribute("data-theme", t); } catch (e) {}
+
+/* Wide shows both panes, narrow shows the selected one. One function decides that from the
+   current width so it is right in both directions - a handler that only unhides leaves the
+   panes stacked when the window shrinks again. */
+const tabs = [[$("#tabMsg"), $("#msgpane")], [$("#tabNode"), $("#nodepane")], [$("#tabMetric"), $("#metricpane")]];
+let active = 0;
+function layout() {
+  const wide = innerWidth >= 860;
+  // Wide: messages on the left always, the right column showing whichever of nodes/metrics
+  // is selected. Narrow: exactly one pane, chosen by the tabs.
+  const sel = (wide && active === 0) ? 1 : active;
+  tabs.forEach(([btn, pane], i) => {
+    btn.setAttribute("aria-selected", String(i === sel));
+    pane.hidden = wide ? (i !== 0 && i !== sel) : i !== active;
+  });
+}
+tabs.forEach(([btn], i) => btn.addEventListener("click", () => { active = i; layout(); }));
+addEventListener("resize", layout);
+layout();
+
+loop();
+</script>
+</body>
+</html>

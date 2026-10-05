@@ -39,6 +39,10 @@ bool begin();
 /// True once begin() has found a valid file.
 bool available();
 
+/// True when the basemap is being read from the SD card rather than internal flash. The
+/// map frame uses this to tell "no card mounted" apart from "card mounted, no map on it".
+bool usingSdCard();
+
 /// Our own position, so the file's origin can be turned into a metre offset. Also picks
 /// overview vs. detail for this zoom and refills the working buffer if the visible set
 /// changed. Cheap to call every frame; it returns immediately when nothing moved.

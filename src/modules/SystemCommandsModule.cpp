@@ -67,7 +67,7 @@ int SystemCommandsModule::handleInputEvent(const InputEvent *event)
 #else
         if (!config.bluetooth.enabled) {
             disableBluetooth();
-#if defined(SDCARD_EXCLUSIVE_WITH_BLUETOOTH)
+#if defined(SDCARD_EXCLUSIVE_WITH_BLE_WIFI)
             // The SD card on this board is gated on Bluetooth being off (see the
             // SD/Bluetooth gate in main.cpp), so switching Bluetooth off has to reboot as
             // well: the card can only be mounted during setup(), so without this the

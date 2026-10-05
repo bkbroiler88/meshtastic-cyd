@@ -27,6 +27,9 @@
 #include <DisplayFormatters.h>
 #include <RadioLibInterface.h>
 #include <target_specific.h>
+#ifdef MESHTASTIC_WEBUI_LITE
+#include "mesh/http/lite/LiteAuth.h"
+#endif
 
 using namespace meshtastic;
 
@@ -117,6 +120,17 @@ void drawFrameWiFi(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, i
     display->drawString(x, getTextPositions(display)[line++], ssidStr);
 
     display->drawString(x, getTextPositions(display)[line++], "URL: http://meshtastic.local");
+
+#ifdef MESHTASTIC_WEBUI_LITE
+    // The console's password is generated on the node and written to /prefs, so the screen is
+    // the only place to read it without a serial cable. getTextPositions() has 7 entries and
+    // the lines above take it to 6, so this is the last one that fits.
+    if (WiFi.status() == WL_CONNECTED && liteAuthPassword()[0] && line < 7) {
+        char loginStr[48];
+        snprintf(loginStr, sizeof(loginStr), "Login: %s / %s", liteAuthUser(), liteAuthPassword());
+        display->drawString(x, getTextPositions(display)[line++], loginStr);
+    }
+#endif
 
     graphics::drawCommonFooter(display, x, y);
 
