@@ -6,6 +6,32 @@
 #include "memory/MemAudit.h"
 #if USE_TFTDISPLAY
 
+namespace graphics
+{
+// Rows owned by a direct drawer; the blit skips them. See tftReserveDirectRows().
+static int16_t s_directRowStart = 0;
+static int16_t s_directRowEnd = 0;
+static inline bool rowIsReserved(int32_t y)
+{
+    return s_directRowEnd > s_directRowStart && y >= s_directRowStart && y < s_directRowEnd;
+}
+// Reserved rows are skipped but still recorded in buffer_back as though they were pushed, so
+// on release they would look unchanged and keep showing whatever the direct drawer left
+// there. One forced repaint hands them back.
+static bool s_directReleased = false;
+static inline bool consumeDirectRelease()
+{
+    const bool was = s_directReleased;
+    s_directReleased = false;
+    return was;
+}
+// The reservation is a lease, refreshed on every frame its owner draws. If the owner stops
+// drawing - the user moved to another frame - it lapses by itself and those rows go back to
+// being painted normally. Without that, leaving the map frame would leave a dead band.
+static uint32_t s_directExpiry = 0;
+static void expireDirectRows(); // defined with the rest of the direct-draw surface below
+} // namespace graphics
+
 #if ARCH_PORTDUINO
 #include "platform/portduino/PortduinoGlue.h"
 #endif
@@ -1388,11 +1414,16 @@ void TFTDisplay::display(bool fromBlank)
     static uint32_t lastColorFrameSignature = 0;
     const bool hasColorRegions = graphics::getTFTColorRegionCount() > 0;
     const uint32_t colorFrameSignature = graphics::getTFTColorFrameSignature();
-    const bool forceFullColorRepaint = forceFullRepaint || (colorFrameSignature != lastColorFrameSignature);
+    graphics::expireDirectRows(); // before consuming the release flag it may set
+    const bool forceFullColorRepaint =
+        forceFullRepaint || (colorFrameSignature != lastColorFrameSignature) || graphics::consumeDirectRelease();
 
     // When region roles/layout changed, color can differ even with identical monochrome glyph bits.
     // Repaint full frame only for those frames, then return to diff-based updates.
     if (forceFullColorRepaint) {
+        // Anything drawn straight to the panel is about to be painted over - see
+        // graphics::tftDirectAvailable(). Bumping this is how those callers find out.
+        graphics::tftNoteFullRepaint();
         for (uint32_t yStart = 0; yStart < displayHeight; yStart += kFullRepaintChunkRows) {
             const uint32_t rowsThisChunk = min<uint32_t>(kFullRepaintChunkRows, displayHeight - yStart);
             for (uint32_t row = 0; row < rowsThisChunk; row++) {
@@ -1428,11 +1459,23 @@ void TFTDisplay::display(bool fromBlank)
                     }
                 }
             }
+            // Push in runs, skipping any rows a direct drawer has reserved - repainting
+            // those would paint black over what it drew. See tftReserveDirectRows().
+            for (uint32_t r = 0; r < rowsThisChunk;) {
+                while (r < rowsThisChunk && graphics::rowIsReserved(yStart + r))
+                    r++;
+                const uint32_t runStart = r;
+                while (r < rowsThisChunk && !graphics::rowIsReserved(yStart + r))
+                    r++;
+                if (r > runStart) {
+                    uint16_t *runBuf = repaintChunkBuffer + (runStart * displayWidth);
 #if defined(HACKADAY_COMMUNICATOR)
-            tft->draw16bitBeRGBBitmap(0, yStart, repaintChunkBuffer, displayWidth, rowsThisChunk);
+                    tft->draw16bitBeRGBBitmap(0, yStart + runStart, runBuf, displayWidth, r - runStart);
 #else
-            tft->pushImage(0, yStart, displayWidth, rowsThisChunk, repaintChunkBuffer);
+                    tft->pushImage(0, yStart + runStart, displayWidth, r - runStart, runBuf);
 #endif
+                }
+            }
         }
 
         memcpy(buffer_back, buffer, displayBufferSize);
@@ -1447,6 +1490,12 @@ void TFTDisplay::display(bool fromBlank)
 
     y = 0;
     while (y < displayHeight) {
+        // Rows a direct drawer owns are never pushed from the 1-bit buffer; it draws all of
+        // them itself, and anything placed here in the buffer simply will not be shown.
+        if (graphics::rowIsReserved(y)) {
+            y++;
+            continue;
+        }
         y_byteIndex = (y / 8) * displayWidth;
         y_byteMask = (1 << (y & 7));
 
@@ -1914,5 +1963,117 @@ bool TFTDisplay::connect()
     }
     return true;
 }
+
+namespace graphics
+{
+static uint32_t s_fullRepaints = 0;
+
+void tftNoteFullRepaint()
+{
+    s_fullRepaints++;
+}
+
+void tftReserveDirectRows(int16_t y0, int16_t y1)
+{
+    s_directRowStart = y0;
+    s_directRowEnd = y1;
+    s_directExpiry = millis() + 500; // refreshed every frame the owner draws
+}
+
+/// Drop a lapsed reservation. Called once per blit, not per row.
+static void expireDirectRows()
+{
+    if (s_directRowEnd > s_directRowStart && (int32_t)(millis() - s_directExpiry) > 0)
+        tftReleaseDirectRows();
+}
+
+void tftReleaseDirectRows()
+{
+    if (s_directRowEnd > s_directRowStart)
+        s_directReleased = true;
+    s_directRowStart = 0;
+    s_directRowEnd = 0;
+}
+
+uint32_t tftFullRepaintCounter()
+{
+    return s_fullRepaints;
+}
+
+// Guarded to the LovyanGFX variants that opt in: `tft` is a different type in the TFT_eSPI
+// and Arduino_GFX branches above, with a different drawing API.
+#if defined(MESHTASTIC_MAP_DIRECT_COLOR) && defined(USE_TFTDISPLAY)
+
+bool tftDirectAvailable()
+{
+    return tft != nullptr;
+}
+
+void tftDirectFillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color)
+{
+    if (tft)
+        tft->fillRect(x, y, w, h, color);
+}
+
+void tftDirectLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color, uint8_t width)
+{
+    if (!tft)
+        return;
+    if (width <= 1)
+        tft->drawLine(x0, y0, x1, y1, color);
+    else
+        tft->drawWideLine(x0, y0, x1, y1, (float)width, color);
+}
+
+void tftDirectCircle(int16_t x, int16_t y, int16_t r, uint16_t color, bool filled)
+{
+    if (!tft)
+        return;
+    if (filled)
+        tft->fillCircle(x, y, r, color);
+    else
+        tft->drawCircle(x, y, r, color);
+}
+
+void tftDirectText(int16_t x, int16_t y, const char *s, uint16_t fg, uint16_t bg)
+{
+    if (!tft || !s)
+        return;
+    tft->setTextColor(fg, bg); // opaque background = the halo, for free
+    tft->setTextDatum(textdatum_t::top_left);
+    tft->drawString(s, x, y);
+}
+
+int16_t tftDirectTextWidth(const char *s)
+{
+    return (tft && s) ? (int16_t)tft->textWidth(s) : 0;
+}
+
+int16_t tftDirectTextHeight()
+{
+    return tft ? (int16_t)tft->fontHeight() : 8;
+}
+
+#else
+
+bool tftDirectAvailable()
+{
+    return false;
+}
+void tftDirectFillRect(int16_t, int16_t, int16_t, int16_t, uint16_t) {}
+void tftDirectLine(int16_t, int16_t, int16_t, int16_t, uint16_t, uint8_t) {}
+void tftDirectCircle(int16_t, int16_t, int16_t, uint16_t, bool) {}
+void tftDirectText(int16_t, int16_t, const char *, uint16_t, uint16_t) {}
+int16_t tftDirectTextWidth(const char *)
+{
+    return 0;
+}
+int16_t tftDirectTextHeight()
+{
+    return 8;
+}
+
+#endif
+} // namespace graphics
 
 #endif // USE_TFTDISPLAY

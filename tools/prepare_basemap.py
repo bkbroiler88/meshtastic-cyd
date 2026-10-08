@@ -101,7 +101,18 @@ out body geom;
 """
 
 
-def fetch(query):
+def fetch(query, cache_path=None):
+    """Query Overpass, optionally caching the raw response.
+
+    A wide box is tens of megabytes and the public endpoints time out often enough that
+    re-querying while tuning the packer is both slow and rude. The cache is keyed by the
+    caller, not the query, so change the box and you must change the cache file.
+    """
+    if cache_path and os.path.exists(cache_path):
+        sys.stderr.write(f"using cached response {cache_path}\n")
+        with open(cache_path, "rb") as f:
+            return json.loads(f.read())
+
     last_err = None
     for endpoint in OVERPASS_ENDPOINTS:
         for attempt in range(3):
@@ -119,6 +130,10 @@ def fetch(query):
                 with urllib.request.urlopen(req, timeout=300) as resp:
                     raw = resp.read()
                 sys.stderr.write(f"  got {len(raw) / 1024:.0f} KiB\n")
+                if cache_path:
+                    with open(cache_path, "wb") as f:
+                        f.write(raw)
+                    sys.stderr.write(f"  cached to {cache_path}\n")
                 return json.loads(raw)
             except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
                 last_err = e
@@ -139,7 +154,7 @@ def classify(tags):
     return None
 
 
-def project_all(elements, lat0, lon0):
+def project_all(elements, lat0, lon0, name_min_len=0.0):
     """Equirectangular to metres east/north of the origin - the same projection the
     firmware uses, so points land exactly where the renderer expects them."""
     m_per_deg_lat = 111132.0
@@ -154,16 +169,51 @@ def project_all(elements, lat0, lon0):
             continue
         # Only roads carry a name - water is never labelled, and leaving those names out
         # keeps the blob inside its 64 KiB addressing.
-        name = ""
-        if layer != LAYER_WATER:
-            name = (tags.get("name") or tags.get("ref") or "")[:NAME_MAX_BYTES]
+        name = road_label(tags, layer) if layer != LAYER_WATER else ""
         pts = [
             ((g["lon"] - lon0) * m_per_deg_lon, (g["lat"] - lat0) * m_per_deg_lat)
             for g in el["geometry"]
         ]
-        if len(pts) >= 2:
-            out.append((layer, name, pts))
+        if len(pts) < 2:
+            continue
+        # A wide box carries tens of thousands of distinct residential street names and the
+        # blob is addressed by uint16, so it overruns its 64 KiB id space long before the
+        # geometry becomes a problem. Short stubs are what fill it, and they are the names
+        # least likely to be wanted: drop the name, keep the road drawn.
+        if name_min_len > 0 and layer == LAYER_LOCAL:
+            length = sum(math.dist(a, b) for a, b in zip(pts, pts[1:]))
+            if length < name_min_len:
+                name = ""
+        out.append((layer, name, pts))
     return out
+
+
+def compact_ref(ref):
+    """"I 95" -> "I-95", "US 40;US 1" -> "US-40". First ref only; a shield shows one number."""
+    first = ref.split(";")[0].strip()
+    return "-".join(first.split())
+
+
+def road_label(tags, layer):
+    """The label a driver would actually recognise, which is not always OSM's `name`.
+
+    Big roads carry the number in `ref` and a ceremonial name in `name`: I-95 through
+    Maryland is "John F. Kennedy Memorial Highway". Preferring `name` there is wrong twice
+    over - nobody calls it that, and at ~35 characters it is wider than the 240 px screen,
+    so the firmware's "road must show 0.8x the label width" rule can never place it and the
+    motorway ends up with no label at all at any zoom. Take `ref` for the classes that have
+    one, `name` for the streets that do not.
+
+    It also makes stitch() work better: consecutive segments of an interstate share one ref
+    but often differ in `name`, and stitch joins on (layer, name).
+    """
+    ref = (tags.get("ref") or "").strip()
+    name = (tags.get("name") or "").strip()
+    if layer == LAYER_MAJOR and ref:
+        label = compact_ref(ref)
+    else:
+        label = name or (compact_ref(ref) if ref else "")
+    return label[:NAME_MAX_BYTES]
 
 
 def stitch(ways):
@@ -308,6 +358,9 @@ def main():
     ap.add_argument("--km", type=float, default=24.0, help="box width in km")
     ap.add_argument("--grid", type=int, default=8, help="detail cells per side")
     ap.add_argument("--no-local", action="store_true", help="skip residential streets")
+    ap.add_argument("--name-min-len", type=float, default=0.0,
+                    help="drop names from local roads shorter than this many metres; "
+                         "the name blob is uint16-addressed and a wide box overruns it")
     ap.add_argument("--overview-min-len", type=float, default=600.0,
                     help="drop overview lines shorter than this many metres")
     ap.add_argument("--out", required=True)
@@ -338,7 +391,7 @@ def main():
 
     elements = data.get("elements", [])
     sys.stderr.write(f"{len(elements)} elements\n")
-    raw = project_all(elements, args.lat, args.lon)
+    raw = project_all(elements, args.lat, args.lon, args.name_min_len)
     sys.stderr.write(f"{len(raw)} usable ways\n")
     raw = stitch(raw)
     sys.stderr.write(f"{len(raw)} after stitching\n")

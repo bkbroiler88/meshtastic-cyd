@@ -77,6 +77,11 @@ bool getOrigin(double &lat, double &lon);
 /// True when the last prepare() selected the cell-indexed detail rather than the overview.
 bool usingDetail();
 
+/// True when the map band is being drawn straight to the panel rather than through the
+/// 1-bit framebuffer. Anything overlaid on the band has to follow it, or it will not show:
+/// the blit does not touch those rows. See graphics::tftReserveDirectRows().
+bool bandIsDirect();
+
 } // namespace BaseMap
 
 } // namespace graphics

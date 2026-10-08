@@ -7,6 +7,7 @@
 #include "gps/GeoCoord.h"
 #include "gps/RTC.h"
 #include "graphics/SharedUIDisplay.h"
+#include "graphics/TFTDisplay.h"
 #include "graphics/draw/BaseMap.h"
 #include "graphics/draw/UIRenderer.h"
 #include "input/InputBroker.h"
@@ -28,6 +29,41 @@ namespace
 float viewRangeM = 1000.0f;
 bool rangePinned = false;
 
+// The map keeps the upper band; everything the user can touch lives in a panel below it.
+// That split is the point: the band is drawn straight to the panel in colour and the panel
+// is ordinary 1-bit BaseUI, and because they share no pixels neither can erase the other.
+// They used to overlap, which is why labels and the scale key blinked in and out.
+// 56 px leaves the map 240x228. Mocked at device scale against 86 and 40: 86 spent a third
+// of the frame on chrome, and 40 bought only 16 px more map while making the scale key and
+// the node toggle fight over one row.
+constexpr int16_t kPanelH = 56;
+constexpr int16_t kBtnW = 40;
+constexpr int16_t kBtnH = 24;
+constexpr int16_t kBtnGap = 5;
+bool showNodes = true;
+int16_t panelTop = 0; // set while drawing, read by the hit test
+
+enum MapBtn { BtnLeft = 0, BtnUp, BtnCentre, BtnDown, BtnRight, BtnCount };
+
+struct Rect {
+    int16_t x, y, w, h;
+    bool holds(int16_t px, int16_t py) const { return px >= x && px < x + w && py >= y && py < y + h; }
+};
+
+// Two rows, not three: at a 19 px font three rows need 57 px and the panel is 56. Row one
+// is the scale key with the node toggle beside it, row two is the D-pad.
+Rect buttonRect(uint8_t i, int16_t screenW, int16_t pTop)
+{
+    const int16_t total = BtnCount * kBtnW + (BtnCount - 1) * kBtnGap;
+    const int16_t x0 = (int16_t)((screenW - total) / 2);
+    return {(int16_t)(x0 + i * (kBtnW + kBtnGap)), (int16_t)(pTop + 26), kBtnW, kBtnH};
+}
+
+Rect nodesToggleRect(int16_t screenW, int16_t pTop)
+{
+    return {(int16_t)(screenW - 98), (int16_t)(pTop + 1), 94, (int16_t)(FONT_HEIGHT_SMALL + 2)};
+}
+
 // Centre offset in metres from the origin, east/north positive. Held at zero for now:
 // panning needs a gesture, and the only one this panel reliably emits is TAP, which has
 // to stay with the frame carousel. Kept because BaseMap::Transform takes it.
@@ -47,7 +83,6 @@ int16_t scrW = 320;
 // The swipe hint is an affordance, not a readout: it shows for a few seconds when the
 // frame is opened and then gets out of the way, because it shares the bottom of the band
 // with the nearest-node line and the two were drawing straight through each other.
-constexpr uint32_t kHintVisibleMs = 6000;
 uint32_t lastDrawMs = 0;
 uint32_t frameEnteredMs = 0;
 
@@ -112,7 +147,9 @@ void drawScaleBar(OLEDDisplay *display, const MapView &v)
     }
     const int16_t px = (int16_t)lroundf(chosen / v.mPerPx);
     const int16_t bx = 6;
-    const int16_t by = v.bottom - 8;
+    // In the panel now, clear of the map band. drawString puts the label a font-height
+    // above the bar, so the bar sits low enough for the text to land on row one.
+    const int16_t by = (int16_t)(panelTop + FONT_HEIGHT_SMALL);
     display->drawLine(bx, by, bx + px, by);
     display->drawLine(bx, by - 3, bx, by + 1);
     display->drawLine(bx + px, by - 3, bx + px, by + 1);
@@ -132,8 +169,44 @@ void drawOwnPosition(OLEDDisplay *display, const MapView &v)
     const ScreenPt p = project(v, v.originLat, v.originLon);
     if (!p.onScreen)
         return;
+#if defined(MESHTASTIC_MAP_DIRECT_COLOR)
+    if (BaseMap::bandIsDirect()) {
+        graphics::tftDirectCircle(p.x, p.y, 6, 0xFFFF, false);
+        graphics::tftDirectCircle(p.x, p.y, 2, 0xFFFF, true);
+        return;
+    }
+#endif
     display->drawCircle(p.x, p.y, 6);
     display->fillCircle(p.x, p.y, 2);
+}
+
+/// The touch panel below the map: scale key, a D-pad, and the node layer toggle. Ordinary
+/// 1-bit BaseUI drawing - it sits outside the reserved band on purpose.
+void drawControlPanel(OLEDDisplay *display, const MapView &v, bool haveMap)
+{
+    const int16_t w = display->getWidth();
+    display->setFont(FONT_SMALL);
+
+    display->drawLine(0, panelTop, w, panelTop);
+
+    // Scale key, with the current range spelled out beside it
+    drawScaleBar(display, v);
+
+    static const char *glyph[BtnCount] = {"<", "^", "o", "v", ">"};
+    for (uint8_t i = 0; i < BtnCount; i++) {
+        const Rect r = buttonRect(i, w, panelTop);
+        display->drawRect(r.x, r.y, r.w, r.h);
+        display->setTextAlignment(TEXT_ALIGN_CENTER);
+        display->drawString((int16_t)(r.x + r.w / 2), (int16_t)(r.y + (r.h - FONT_HEIGHT_SMALL) / 2), glyph[i]);
+    }
+
+    (void)haveMap;
+    const Rect t = nodesToggleRect(w, panelTop);
+    char line[32];
+    snprintf(line, sizeof(line), "%s Nodes", showNodes ? "[x]" : "[ ]");
+    display->setTextAlignment(TEXT_ALIGN_RIGHT);
+    display->drawString((int16_t)(w - 4), (int16_t)(t.y + 1), line);
+    display->setTextAlignment(TEXT_ALIGN_LEFT);
 }
 
 } // namespace
@@ -161,7 +234,8 @@ void MapRenderer::drawMapFrame(OLEDDisplay *display, OLEDDisplayUiState *state, 
 
     MapView v;
     v.top = FONT_HEIGHT_SMALL + 1;
-    v.bottom = display->getHeight() - 16;
+    panelTop = (int16_t)(display->getHeight() - 16 - kPanelH);
+    v.bottom = panelTop;
     v.cx = display->getWidth() / 2;
     v.cy = (v.top + v.bottom) / 2;
 
@@ -222,9 +296,10 @@ void MapRenderer::drawMapFrame(OLEDDisplay *display, OLEDDisplayUiState *state, 
         return;
     }
 
-    // Always centred on the origin. Free panning would need a gesture, and the only one
-    // this panel reliably produces is TAP, which has to stay with the carousel.
-    panEastM = panNorthM = 0.0f;
+    // Panning is the D-pad's job now. It used to be pinned to the origin every frame
+    // because the only gesture this panel reliably produces is TAP, and TAP has to stay
+    // with the carousel - the buttons in the panel below give pan its own input without
+    // taking that away.
 
     // Auto-fit: scale so the furthest node with a position sits inside the band, unless
     // the user has pinned the range by zooming.
@@ -252,10 +327,57 @@ void MapRenderer::drawMapFrame(OLEDDisplay *display, OLEDDisplayUiState *state, 
     }
     v.mPerPx = viewRangeM / (float)halfSpanPx;
 
+    // Does the band need redrawing at all?
+    //
+    // When the band is drawn direct, every line, label and marker goes onto the SPI bus, so
+    // repeating an unchanged picture every tick is pure churn - it reads as a constant
+    // redraw, worst where there are the most labels. The monochrome path has no such cost
+    // (it writes a framebuffer the blit then diffs), so it always draws.
+    //
+    // Everything that can change what the band shows has to be in here, which is why it
+    // covers the node set and not just the view: a marker appearing is as much a change as
+    // a pan. Positions are folded in coarsely - whole metres - so that float noise in a
+    // position report cannot by itself force a repaint.
+    uint32_t bandSig = (uint32_t)(v.cx * 31 + v.cy * 131 + v.top * 13 + v.bottom * 17);
+    bandSig = bandSig * 2654435761u + (uint32_t)lroundf(v.mPerPx * 64.0f);
+    bandSig = bandSig * 2246822519u + (uint32_t)((int32_t)panEastM * 7 + (int32_t)panNorthM * 11);
+    bandSig = bandSig * 3266489917u + (showNodes ? 1u : 0u) + (ownPosKnown ? 2u : 0u);
+    bandSig = bandSig * 668265263u + (uint32_t)(v.originLat * 1e4) + (uint32_t)(v.originLon * 1e4);
+    if (showNodes) {
+        for (size_t i = 0; i < nodeDB->getNumMeshNodes(); i++) {
+            meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
+            if (!plottable(n))
+                continue;
+            meshtastic_PositionLite np;
+            if (!nodeDB->copyNodePosition(n->num, np))
+                continue;
+            bandSig = bandSig * 374761393u + n->num + (uint32_t)(np.latitude_i / 100) + (uint32_t)(np.longitude_i / 100) +
+                      (uint32_t)(n->last_heard / 30); // 30 s buckets: "stale" flips slowly
+        }
+    }
+    bandSig ^= graphics::tftFullRepaintCounter() * 2654435761u; // repainted over? draw again
+
+    static uint32_t lastBandSig = 0;
+    const bool bandDirty = (bandSig != lastBandSig);
+    lastBandSig = bandSig;
+
     // Roads and water underneath, if a basemap for this area is on the filesystem. Drawn
     // first so node markers and labels sit on top of it.
+    bool bandDirect = false;
+#if defined(MESHTASTIC_MAP_DIRECT_COLOR)
+    bandDirect = graphics::tftDirectAvailable() && haveMap;
+    if (bandDirect) {
+        // Claim the band. This is refreshed EVERY frame, never skipped by the redraw gate -
+        // the lease is what keeps the blit off these rows, and letting it lapse while the
+        // frame is still on screen would hand the band back mid-view and black it out.
+        graphics::tftReserveDirectRows(v.top, v.bottom);
+    }
+#endif
+    // The 1-bit path has to redraw every frame because the framebuffer was just cleared.
+    const bool drawBand = !bandDirect || bandDirty;
+
     BaseMap::Transform mapT;
-    if (haveMap) {
+    if (haveMap && drawBand) {
         BaseMap::beginFrame();
         BaseMap::prepare(v.originLat, v.originLon, v.mPerPx, halfSpanPx);
         BaseMap::Transform t;
@@ -272,6 +394,10 @@ void MapRenderer::drawMapFrame(OLEDDisplay *display, OLEDDisplayUiState *state, 
         BaseMap::draw(display, t);
         mapT = t;
     }
+#if defined(MESHTASTIC_MAP_DIRECT_COLOR)
+    if (!haveMap)
+        graphics::tftReleaseDirectRows(); // nothing to own; the messages below are 1-bit
+#endif
 
     // Nodes. Filled = heard recently, hollow = stale. Short name only; detail is a tap away.
     display->setFont(FONT_SMALL);
@@ -284,7 +410,7 @@ void MapRenderer::drawMapFrame(OLEDDisplay *display, OLEDDisplayUiState *state, 
     meshtastic_NodeInfoLite *nearest = nullptr;
     float nearestM = 0.0f;
 
-    for (size_t i = 0; i < nodeDB->getNumMeshNodes(); i++) {
+    for (size_t i = 0; drawBand && showNodes && i < nodeDB->getNumMeshNodes(); i++) {
         meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
         if (!plottable(n))
             continue;
@@ -304,14 +430,22 @@ void MapRenderer::drawMapFrame(OLEDDisplay *display, OLEDDisplayUiState *state, 
             continue;
 
         const bool stale = (nowSec && n->last_heard && (nowSec - n->last_heard) > kStaleAfterSec);
-        if (stale)
+        // Markers live inside the band, so they follow whoever owns it - put them in the
+        // 1-bit buffer while the band is drawn direct and they simply never appear.
+        if (bandDirect)
+            graphics::tftDirectCircle(p.x, p.y, 3, 0xFFFF, !stale);
+        else if (stale)
             display->drawCircle(p.x, p.y, 3);
         else
             display->fillCircle(p.x, p.y, 3);
 
         if (n->short_name[0]) {
             const int16_t lx = (int16_t)(p.x + 6), ly = (int16_t)(p.y - FONT_HEIGHT_SMALL / 2);
-            display->drawString(lx, ly, n->short_name);
+            if (bandDirect) {
+                graphics::tftDirectText(lx, ly, n->short_name, 0xFFFF, 0x1082);
+            } else {
+                display->drawString(lx, ly, n->short_name);
+            }
             if (haveMap) {
                 const int16_t lw = (int16_t)display->getStringWidth(n->short_name, strlen(n->short_name), false);
                 BaseMap::reserve(lx, ly, (int16_t)(lw + 2), FONT_HEIGHT_SMALL);
@@ -321,30 +455,25 @@ void MapRenderer::drawMapFrame(OLEDDisplay *display, OLEDDisplayUiState *state, 
         plotted++;
     }
 
-    if (ownPosKnown)
+    if (ownPosKnown && drawBand)
         drawOwnPosition(display, v);
-    drawScaleBar(display, v);
 
-    // Two stacked rows at the foot of the band: the nearest-node line, and above it the
-    // swipe hint while it is still showing. They used to share one row, left- and
-    // right-aligned, and overlapped as soon as either string got long.
-    const int16_t yDetail = (int16_t)(v.bottom - FONT_HEIGHT_SMALL - 12);
-    const int16_t yHint = (int16_t)(yDetail - FONT_HEIGHT_SMALL - 2);
-    const bool showHint = Throttle::isWithinTimespanMs(frameEnteredMs, kHintVisibleMs);
+    // The nearest-node line stays at the foot of the band - it is map content, not a
+    // control. The swipe hint is gone: it existed because the frame had no visible controls
+    // and an inert-looking screen reads as a hang, which the D-pad now answers directly.
+    const int16_t yDetail = (int16_t)(v.bottom - FONT_HEIGHT_SMALL - 2);
 
-    if (haveMap) {
+    if (haveMap && drawBand) {
         // Reserve everything already on screen before the street names go down. The
         // position ring especially: a knockout box over it erases the one thing the frame
         // exists to show.
         BaseMap::reserve((int16_t)(v.cx - 8), (int16_t)(v.cy - 8), 17, 17);
         BaseMap::reserve(0, (int16_t)(yDetail - 2), display->getWidth(),
-                         (int16_t)(v.bottom - yDetail + 2)); // scale bar + detail line band
-        if (showHint)
-            BaseMap::reserve(0, yHint, display->getWidth(), FONT_HEIGHT_SMALL);
+                         (int16_t)(v.bottom - yDetail + 2)); // the detail line
     }
 
     // Detail line for the nearest node, along the bottom of the band.
-    if (nearest) {
+    if (nearest && drawBand) {
         char line[48];
         const char *nm = nearest->short_name[0] ? nearest->short_name : "?";
         // snr is the live in-memory reading and is zeroed on disk; snr_q4 is what
@@ -358,26 +487,31 @@ void MapRenderer::drawMapFrame(OLEDDisplay *display, OLEDDisplayUiState *state, 
             snprintf(line, sizeof(line), "%s  %.1f km  %.1fdB", nm, nearestM / 1000.0f, snrDb);
         else
             snprintf(line, sizeof(line), "%s  %d m  %.1fdB", nm, (int)nearestM, snrDb);
-        display->drawString(6, yDetail, line);
-    } else if (plotted == 0) {
-        display->setTextAlignment(TEXT_ALIGN_CENTER);
-        display->drawString(v.cx, v.cy + 14, "No nodes with position");
-        display->setTextAlignment(TEXT_ALIGN_LEFT);
+        if (bandDirect)
+            graphics::tftDirectText(6, yDetail, line, 0xFFFF, 0x1082);
+        else
+            display->drawString(6, yDetail, line);
+    } else if (plotted == 0 && showNodes && drawBand) {
+        // Only when nodes are meant to be shown. With the box unchecked the empty map is
+        // the answer - the unticked box already says why there are no markers.
+        const char *msg = "No nodes with position";
+        if (bandDirect) {
+            const int16_t tw = graphics::tftDirectTextWidth(msg);
+            graphics::tftDirectText((int16_t)(v.cx - tw / 2), (int16_t)(v.cy + 14), msg, 0xFFFF, 0x1082);
+        } else {
+            display->setTextAlignment(TEXT_ALIGN_CENTER);
+            display->drawString(v.cx, v.cy + 14, msg);
+            display->setTextAlignment(TEXT_ALIGN_LEFT);
+        }
     }
 
     // Street names last: they need to know what every marker already claimed.
-    if (haveMap)
+    if (haveMap && drawBand)
         BaseMap::drawLabels(display, mapT);
 
-    // The frame has no visible controls otherwise, and a screen that looks inert reads as
-    // a hang - which is exactly how the tap-consuming version presented. Shown on entry
-    // only; the scale bar is the permanent indication of zoom.
-    if (showHint) {
-        display->setTextAlignment(TEXT_ALIGN_RIGHT);
-        display->drawString(display->getWidth() - 4, yHint,
-                            rangePinned ? "swipe up/dn zoom" : "swipe up/dn  auto");
-        display->setTextAlignment(TEXT_ALIGN_LEFT);
-    }
+    // Controls below the band, in ordinary 1-bit BaseUI. Drawn after the map so a stale
+    // reservation can never leave the panel unpainted.
+    drawControlPanel(display, v, haveMap);
 }
 
 bool MapRenderer::handleInput(const InputEvent *event)
@@ -385,11 +519,50 @@ bool MapRenderer::handleInput(const InputEvent *event)
     if (!event)
         return false;
 
-    // Same vocabulary the on-screen keyboard uses (see
+    // A tap is hit-tested against the control panel ONLY - never against the map band.
+    // An earlier version hit-tested the whole frame and consumed every tap, which trapped
+    // the user here: TAP is what Screen.cpp uses to advance the carousel, and on this panel
+    // it is the gesture that demonstrably works. Taps on the map still fall through, so
+    // there is always a way out, and a tap that hits no control is not consumed either.
+    if (event->inputEvent == INPUT_BROKER_USER_PRESS && panelTop > 0 && (int16_t)event->touchY >= panelTop) {
+        const int16_t tx = (int16_t)event->touchX, ty = (int16_t)event->touchY;
+        const int16_t w = scrW ? scrW : 240;
+
+        if (nodesToggleRect(w, panelTop).holds(tx, ty)) {
+            showNodes = !showNodes;
+            return true;
+        }
+        for (uint8_t i = 0; i < BtnCount; i++) {
+            if (!buttonRect(i, w, panelTop).holds(tx, ty))
+                continue;
+            // Pan a third of the half-span per press: far enough to make progress, short
+            // enough that you can still see where you came from.
+            const float step = viewRangeM * 0.33f;
+            switch (i) {
+            case BtnLeft:
+                panEastM -= step;
+                break;
+            case BtnRight:
+                panEastM += step;
+                break;
+            case BtnUp:
+                panNorthM += step;
+                break;
+            case BtnDown:
+                panNorthM -= step;
+                break;
+            case BtnCentre:
+                MapRenderer::resetView();
+                break;
+            }
+            return true;
+        }
+        return false; // a tap in the panel that missed everything still advances the frame
+    }
+
+    // Otherwise the same vocabulary the on-screen keyboard uses (see
     // OnScreenKeyboardModule::processVirtualKeyboardInput): swipes step, a tap advances,
-    // a long press commits. Deliberately no coordinate hit-testing - nothing else in
-    // BaseUI does it, and touchX/touchY would have to track the runtime portrait/landscape
-    // flip and the panel's calibration to be usable.
+    // a long press commits.
     switch (event->inputEvent) {
     case INPUT_BROKER_UP:
         rangePinned = true;

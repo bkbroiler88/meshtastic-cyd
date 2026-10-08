@@ -6,6 +6,9 @@
 #include "NodeDB.h" // for `config`, to check whether Bluetooth is holding the SD card off
 #include "configuration.h"
 #include "graphics/ScreenFonts.h" // FONT_SMALL / FONT_HEIGHT_SMALL for the street labels
+#if defined(MESHTASTIC_MAP_DIRECT_COLOR)
+#include "graphics/TFTDisplay.h"
+#endif
 #include <cmath>
 #include <cstring>
 
@@ -31,7 +34,11 @@ constexpr uint32_t kTableOff = 32; // header is 32 bytes in v2, offset table fol
 // gated by zoom, ranked by road class and how much of the road is actually on screen, and
 // dropped outright when they would overlap anything already placed.
 constexpr uint8_t kLabelsMax = 6;
-constexpr float kLabelZoomMPerPx = 8.0f;  // no names at all above this
+// A name's zoom gate follows its road class: an interstate is worth naming from much
+// further out than a cul-de-sac. One flat cutoff at 8 m/px meant a 1 km view - 8.8 m/px on
+// a 228 px band - showed no names at all, which read as "the motorways have no names".
+constexpr float kLabelZoomMPerPx = 30.0f; // no names of any class above this
+constexpr float kMinorZoomMPerPx = 8.0f;  // secondary/tertiary names below this
 constexpr float kLocalZoomMPerPx = 3.0f;  // residential names only below this
 constexpr float kMinRunFactor = 0.8f;     // road must show this much of the label's width
 constexpr int32_t kDedupePx = 110;        // do not repeat one name within this distance
@@ -168,7 +175,47 @@ bool clipSeg(int32_t &x0, int32_t &y0, int32_t &x1, int32_t &y1, const BaseMap::
 /// Bresenham with an optional dash, so water reads differently from roads on a 1-bit panel.
 /// Returns the drawn (clipped) length in pixels and, in midX/midY, that piece's midpoint -
 /// the label engine needs both, and only the clipped part of a road counts toward a name.
-int32_t drawSeg(OLEDDisplay *display, int32_t x0, int32_t y0, int32_t x1, int32_t y1, bool dashed,
+#if defined(MESHTASTIC_MAP_DIRECT_COLOR)
+// RGB565. The panel is 16-bit even though BaseUI composes in one bit, so the map band is
+// drawn straight to it - see graphics::tftDirectAvailable() for why that is safe and what
+// it costs (nothing: a per-pixel colour buffer for this area would be 15 KB at four
+// colours, which this board does not have).
+// Hierarchy comes from lightness and width; hue only hints at what a thing is. Saturated
+// colour at full brightness on black reads as highlighter, not cartography, so everything
+// here is deliberately dull - the brightest road is a warm off-white, not an amber.
+constexpr uint16_t kColWater = 0x2A4B; // #27485C desaturated slate blue, sits back
+constexpr uint16_t kColLocal = 0x4AAC; // #4E555F barely above the background
+constexpr uint16_t kColMinor = 0x7C11; // #7A828E cool mid grey
+constexpr uint16_t kColMajor = 0xC5F4; // #C9BFA8 warm pale sand, the brightest thing drawn
+constexpr uint16_t kColLabel = 0xFFFF; // street names, knocked out of the geometry
+constexpr uint16_t kColMapBg = 0x1082; // #101014 near-black, slightly cool
+
+inline uint16_t layerColor(uint8_t layer)
+{
+    switch (layer) {
+    case 0:
+        return kColWater;
+    case 1:
+        return kColMajor;
+    case 2:
+        return kColMinor;
+    default:
+        return kColLocal;
+    }
+}
+
+/// Width carries the hierarchy as much as lightness does. 3 px was too fat for a 240 px
+/// panel - it blobbed at junctions and made the trunk roads look drawn on with a marker.
+inline uint8_t layerWidth(uint8_t layer)
+{
+    return layer == 1 ? 2 : 1;
+}
+
+/// Set once per frame so the inner loop does not re-test the display type per segment.
+bool directColor = false;
+#endif
+
+int32_t drawSeg(OLEDDisplay *display, int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint8_t layer,
                 const BaseMap::Transform &t, int32_t *midX = nullptr, int32_t *midY = nullptr)
 {
     if (!clipSeg(x0, y0, x1, y1, t))
@@ -180,6 +227,16 @@ int32_t drawSeg(OLEDDisplay *display, int32_t x0, int32_t y0, int32_t x1, int32_
     }
     const int32_t lenDx = x1 - x0, lenDy = y1 - y0;
     const int32_t drawn = (int32_t)lroundf(sqrtf((float)(lenDx * lenDx + lenDy * lenDy)));
+
+#if defined(MESHTASTIC_MAP_DIRECT_COLOR)
+    if (directColor) {
+        graphics::tftDirectLine((int16_t)x0, (int16_t)y0, (int16_t)x1, (int16_t)y1, layerColor(layer), layerWidth(layer));
+        return drawn;
+    }
+#endif
+    // Monochrome fallback: water is dashed, because at one bit it is the only way to tell
+    // a creek from a lane.
+    const bool dashed = (layer == 0);
 
     const int32_t adx = (x1 > x0) ? (x1 - x0) : (x0 - x1);
     const int32_t ady = (y1 > y0) ? (y1 - y0) : (y0 - y1);
@@ -324,7 +381,7 @@ void drawSection(OLEDDisplay *display, File &f, const Entry &e, const BaseMap::T
                 const int32_t sy = t.cy - (int32_t)lroundf(nn * inv);
                 if (!first) {
                     int32_t mx = 0, my = 0;
-                    const int32_t drawn = drawSeg(display, px, py, sx, sy, isWater, t, &mx, &my);
+                    const int32_t drawn = drawSeg(display, px, py, sx, sy, layer, t, &mx, &my);
                     if (wantName && drawn > 0) {
                         totalRun += drawn;
                         if (drawn > bestSeg) {
@@ -499,7 +556,9 @@ void BaseMap::drawLabels(OLEDDisplay *display, const Transform &t)
 
     for (uint8_t i = 0; i < nCands && placed < kLabelsMax; i++) {
         const LabelCand &c = cands[i];
-        if (c.layer == 3 && t.mPerPx > kLocalZoomMPerPx)
+        if (c.layer >= 3 && t.mPerPx > kLocalZoomMPerPx)
+            continue;
+        if (c.layer == 2 && t.mPerPx > kMinorZoomMPerPx)
             continue;
 
         // Same name already on screen nearby - one "Edgewood Road" is enough.
@@ -540,12 +599,21 @@ void BaseMap::drawLabels(OLEDDisplay *display, const Transform &t)
         if (overlaps(bx, y, bw, FONT_HEIGHT_SMALL))
             continue; // never shuffle a label away from its road - drop it instead
 
-        // Knock the geometry out from behind the text: at 1 bit, a name over road lines is
-        // unreadable.
-        display->setColor(BLACK);
-        display->fillRect(bx, y, bw, FONT_HEIGHT_SMALL);
-        display->setColor(WHITE);
-        display->drawString(x, y, name);
+        // Knock the geometry out from behind the text: a name laid straight over road lines
+        // is unreadable at any depth.
+#if defined(MESHTASTIC_MAP_DIRECT_COLOR)
+        if (directColor) {
+            // The band has one owner, so a label cannot be left in the 1-bit buffer: the
+            // blit never reaches these rows. Opaque text gives the knock-out for free.
+            graphics::tftDirectText(x, y, name, kColLabel, kColMapBg);
+        } else
+#endif
+        {
+            display->setColor(BLACK);
+            display->fillRect(bx, y, bw, FONT_HEIGHT_SMALL);
+            display->setColor(WHITE);
+            display->drawString(x, y, name);
+        }
 
         reserve(bx, y, bw, FONT_HEIGHT_SMALL);
         placedIds[placed] = c.nameId;
@@ -560,6 +628,15 @@ void BaseMap::drawLabels(OLEDDisplay *display, const Transform &t)
 bool BaseMap::usingDetail()
 {
     return curDetail;
+}
+
+bool BaseMap::bandIsDirect()
+{
+#if defined(MESHTASTIC_MAP_DIRECT_COLOR)
+    return directColor;
+#else
+    return false;
+#endif
 }
 
 void BaseMap::getOriginOffset(float &offsetE, float &offsetN)
@@ -611,8 +688,27 @@ void BaseMap::prepare(double viewOriginLat, double viewOriginLon, float mPerPx, 
 
 void BaseMap::draw(OLEDDisplay *display, const Transform &t)
 {
+#if defined(MESHTASTIC_MAP_DIRECT_COLOR)
+    // Decided before the early return, because the node overlay asks bandIsDirect() after
+    // this call and a stale answer would send markers to the wrong layer.
+    directColor = ok && graphics::tftDirectAvailable();
+#endif
     if (!ok)
         return;
+
+#if defined(MESHTASTIC_MAP_DIRECT_COLOR)
+    if (directColor) {
+        // Own the band: clear it ourselves, since the monochrome buffer is left blank here
+        // and so the blit will never clear it for us.
+        //
+        // Whether to redraw at all is decided by the caller, not here. This used to gate
+        // itself on the view, which covered the roads and nothing else - labels, markers and
+        // the detail line are drawn by MapRenderer after this returns, so they went onto the
+        // SPI bus every tick regardless and the band visibly churned. The gate has to cover
+        // everything in the band or it covers nothing.
+        graphics::tftDirectFillRect(t.left, t.top, (int16_t)(t.right - t.left + 1), (int16_t)(t.bottom - t.top + 1), kColMapBg);
+    }
+#endif
 
     auto f = openMap();
     if (!f)
