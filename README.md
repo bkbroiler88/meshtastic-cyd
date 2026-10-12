@@ -44,7 +44,7 @@ the Meshtastic phone app over Bluetooth.
 The display and touchscreen are already on the board. These are the wires you
 add for the radio:
 
-| E22-900M30S | GPIO | |
+| E22-900M30S | GPIO-CYD | |
 |---|---|---|
 | SCK | 18 | shared with the microSD slot |
 | MISO | 19 | shared |
