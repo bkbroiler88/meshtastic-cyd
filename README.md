@@ -7,6 +7,7 @@ street names, and battery sensing.
 
 **Lora board can be purchased [here](https://Witelesswizard.net)
 
+<img width="960" height="1280" alt="IMG_1621" src="https://github.com/user-attachments/assets/5222b058-ffde-42e3-ba0d-4ac82d70dab3" />
 
 > **This is not official Meshtastic, and not affiliated with the Meshtastic
 > project.** It is a personal fork adding support for one hand-wired board.
