@@ -5,6 +5,8 @@ Board support for running [Meshtastic](https://meshtastic.org) on a hand-wired
 **Ebyte E22-900M30S** LoRa module — touchscreen UI, an offline vector map with
 street names, and battery sensing.
 
+**Lora bouaee can be purchased [here](https://Witelesswizard.net)
+
 > **This is not official Meshtastic, and not affiliated with the Meshtastic
 > project.** It is a personal fork adding support for one hand-wired board.
 > Upstream firmware lives at
