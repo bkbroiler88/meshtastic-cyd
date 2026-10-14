@@ -14,6 +14,7 @@
 #include "main.h"
 #include "mesh/Throttle.h"
 #include <cmath>
+#include <cstdint>
 
 namespace graphics
 {
@@ -509,6 +510,17 @@ void MapRenderer::drawMapFrame(OLEDDisplay *display, OLEDDisplayUiState *state, 
     if (haveMap && drawBand)
         BaseMap::drawLabels(display, mapT);
 
+#if defined(MESHTASTIC_MAP_DIRECT_COLOR)
+    // Re-take the lease now the drawing is done. Taking it only at the top was not enough:
+    // zoomed out the band pushes thousands of segments straight at the panel and the draw
+    // alone outruns the lease, so the blit that follows saw it expired, handed the rows
+    // back, forced a full repaint, and blacked the band - which the next frame redrew, and
+    // round again. Refreshing here means the lease only has to outlive the gap between
+    // frames, not the work inside one.
+    if (bandDirect)
+        graphics::tftReserveDirectRows(v.top, v.bottom);
+#endif
+
     // Controls below the band, in ordinary 1-bit BaseUI. Drawn after the map so a stale
     // reservation can never leave the panel unpainted.
     drawControlPanel(display, v, haveMap);
@@ -532,9 +544,26 @@ bool MapRenderer::handleInput(const InputEvent *event)
             showNodes = !showNodes;
             return true;
         }
-        for (uint8_t i = 0; i < BtnCount; i++) {
-            if (!buttonRect(i, w, panelTop).holds(tx, ty))
-                continue;
+        // D-pad row: anywhere in the row, the NEAREST button wins. Exact rectangles were too
+        // strict for this panel - captured taps land ~10 px left of where the finger aims
+        // (centre aimed 160, reported 150; right aimed 250, reported ~241). Mid-row that just
+        // shifts a tap within a 40 px button, but on the leftmost button it put taps at x=48
+        // against a rect starting at 50: the tap missed, fell through, and advanced the
+        // carousel instead of panning. Nearest-wins absorbs the bias, covers the 5 px gaps,
+        // and runs the end buttons out to the screen edges. Vertical slack is kept small so
+        // a tap clearly above or below the row still falls through to the carousel.
+        const Rect row = buttonRect(0, w, panelTop);
+        if (ty >= row.y - 6 && ty < row.y + row.h + 6) {
+            uint8_t i = 0;
+            int32_t bestD = INT32_MAX;
+            for (uint8_t b = 0; b < BtnCount; b++) {
+                const Rect r = buttonRect(b, w, panelTop);
+                const int32_t d = abs((int32_t)tx - (int32_t)(r.x + r.w / 2));
+                if (d < bestD) {
+                    bestD = d;
+                    i = b;
+                }
+            }
             // Pan a third of the half-span per press: far enough to make progress, short
             // enough that you can still see where you came from.
             const float step = viewRangeM * 0.33f;

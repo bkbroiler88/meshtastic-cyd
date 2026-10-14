@@ -28,7 +28,11 @@ import urllib.error
 import urllib.request
 
 MAGIC = b"MBM1"
-FORMAT_VERSION = 2  # v2 adds street names: a name blob plus a 2-byte id on every way
+# v2 added street names: one global blob plus a 2-byte id on every way.
+# v3 makes each section self-contained - its own name blob - and widens points to i32.
+# That lifts both of v2's ceilings: a 65 km box (i16 metres from the file origin) and
+# 64 KiB of names in total (u16 ids into one blob). Neither was a property of the board.
+FORMAT_VERSION = 3
 
 # A name id is the byte offset of its length-prefixed string inside the name blob, so a
 # lookup is one seek and one read. That caps the blob at 64 KiB, which is far more than a
@@ -340,7 +344,7 @@ def build_name_blob(ways_lists):
 
 
 def pack_ways(ways, name_ids):
-    """ways: list of (layer, name, pts). Returns packed bytes for one section."""
+    """v2: ways: list of (layer, name, pts). Returns packed bytes for one section."""
     buf = bytearray()
     buf += struct.pack("<I", len(ways))
     for layer, name, pts in ways:
@@ -348,6 +352,40 @@ def pack_ways(ways, name_ids):
         buf += struct.pack("<BHH", layer, len(pts), nid)
         for x, y in pts:
             buf += struct.pack("<hh", int(round(x)), int(round(y)))
+    return bytes(buf)
+
+
+def pack_section_v3(ways):
+    """One self-contained section: its own names, then its ways.
+
+        u32 nameLen
+        <nameLen bytes>      length-prefixed strings
+        u32 wayCount
+        ways: u8 layer, u16 npts, u16 nameId, npts * (i32 x, i32 y)
+
+    nameId is a byte offset inside THIS section's blob, which is why the 64 KiB name
+    ceiling disappears: a cell holds a few hundred names, not a whole county's worth.
+    Points are i32 metres from the file origin - v2's i16 capped a map at a 65 km box,
+    and doubling the coordinate is the cheapest way to lift that. It costs file size on
+    an SD card, which is the one resource here that is not scarce.
+    """
+    seen, blob, ids = set(), bytearray(), {}
+    for _, name, _ in ways:
+        if name and name not in seen:
+            seen.add(name)
+            enc = name.encode("utf-8")[:NAME_MAX_BYTES]
+            ids[name] = len(blob)
+            blob += bytes([len(enc)]) + enc
+
+    buf = bytearray()
+    buf += struct.pack("<I", len(blob))
+    buf += blob
+    buf += struct.pack("<I", len(ways))
+    for layer, name, pts in ways:
+        nid = ids.get(name, NAME_NONE) if name else NAME_NONE
+        buf += struct.pack("<BHH", layer, len(pts), nid)
+        for x, y in pts:
+            buf += struct.pack("<ii", int(round(x)), int(round(y)))
     return bytes(buf)
 
 
@@ -440,9 +478,9 @@ def main():
             if cur_cell is not None and len(cur_pts) >= 2:
                 cells[cur_cell].append((layer, name, cur_pts))
 
-    name_blob, name_ids = build_name_blob([overview] + cells)
-    overview_blob = pack_ways(overview, name_ids)
-    cell_blobs = [pack_ways(c, name_ids) for c in cells]
+    overview_blob = pack_section_v3(overview)
+    cell_blobs = [pack_section_v3(c) for c in cells]
+    name_blob = b""  # v3 keeps names inside each section; nothing global is left
 
     header = bytearray()
     header += MAGIC
@@ -452,7 +490,8 @@ def main():
     header += struct.pack("<ii", int(round(args.lat * 1e7)), int(round(args.lon * 1e7)))
     header += struct.pack("<I", int(round(half_m)))
     header += struct.pack("<I", int(round(cell_m)))
-    # v2: name blob offset/len, filled in once the layout is known (header is 32 bytes)
+    # v2 put the global name blob's offset/len here. v3 has no global blob, so these stay
+    # zero - the field is kept only so the offset table still starts at byte 32.
     name_off_pos = len(header)
     header += struct.pack("<II", 0, 0)
 
@@ -469,9 +508,7 @@ def main():
         table += struct.pack("<II", off, len(blob))
         off += len(blob)
 
-    # the name blob sits after the sections
-    struct.pack_into("<II", header, name_off_pos, off, len(name_blob))
-    off += len(name_blob)
+    struct.pack_into("<II", header, name_off_pos, 0, 0)
 
     with open(args.out, "wb") as f:
         f.write(header)
@@ -484,14 +521,20 @@ def main():
     total = off
     ov_pts = sum(len(p) for _, _, p in overview)
     det_pts = sum(len(p) for c in cells for _, _, p in c)
-    nonempty = sum(1 for b in cell_blobs if len(b) > 4)
+    nonempty = sum(1 for b in cell_blobs if len(b) > 8)  # v3 empty = 4B names + 4B count
     named = sum(1 for c in cells for w in c if w[1])
     print(f"wrote {args.out}")
     print(f"  total      {total:,} bytes ({total / 1024:.0f} KiB)")
     print(f"  overview   {len(overview):,} ways / {ov_pts:,} pts / {len(overview_blob) / 1024:.0f} KiB")
     print(f"  detail     {sum(len(c) for c in cells):,} ways / {det_pts:,} pts across {nonempty}/{args.grid ** 2} cells")
     print(f"  largest cell {max(len(b) for b in cell_blobs) / 1024:.1f} KiB")
-    print(f"  names      {len(name_ids):,} distinct / {named:,} labelled ways / {len(name_blob) / 1024:.1f} KiB")
+    # v3 keeps names per section, so "distinct" is counted across the whole file and the
+    # per-section figure is what actually has to stay under the u16 id space.
+    all_names = {w[1] for sec in [overview] + cells for w in sec if w[1]}
+    name_bytes = sum(struct.unpack_from("<I", b, 0)[0] for b in [overview_blob] + cell_blobs)
+    worst = max(struct.unpack_from("<I", b, 0)[0] for b in [overview_blob] + cell_blobs)
+    print(f"  names      {len(all_names):,} distinct / {named:,} labelled ways / {name_bytes / 1024:.1f} KiB")
+    print(f"  worst section name blob {worst:,} B of {NAME_NONE:,} addressable")
 
 
 if __name__ == "__main__":

@@ -24,7 +24,12 @@ namespace
 {
 
 constexpr const char *kPath = "/basemap.bin";
-constexpr uint8_t kFormatVersion = 2; // v2 adds the name blob and a name id per way
+// v2: one global name blob, i16 points from the file origin. v3: each section carries its
+// own name blob and points are i32, which lifts v2's 65 km box and 64 KiB name ceilings.
+// Both are read, so a card written by an older packer keeps working.
+constexpr uint8_t kFormatV2 = 2;
+constexpr uint8_t kFormatV3 = 3;
+uint8_t formatVer = kFormatV2;
 constexpr uint8_t kMaxGrid = 16;
 constexpr uint32_t kTableOff = 32; // header is 32 bytes in v2, offset table follows
 
@@ -47,7 +52,9 @@ constexpr uint16_t kNameNone = 0xFFFF;
 constexpr uint8_t kNameMax = 48; // matches NAME_MAX_BYTES in prepare_basemap.py, plus NUL
 
 struct LabelCand {
-    uint16_t nameId;
+    // v2 stores an offset into the one global blob; v3 an absolute file offset, because
+    // each section has its own blob and the candidate outlives the section read.
+    uint32_t nameId;
     int16_t x, y;   // anchor: midpoint of the longest visible segment, so it is on the road
     uint16_t run;   // total visible length in px, which is what earns the label
     uint8_t layer;
@@ -339,7 +346,18 @@ void drawSection(OLEDDisplay *display, File &f, const Entry &e, const BaseMap::T
     uint8_t hdr[4];
     if (mapRead(f, hdr, 4) != 4)
         return;
+
+    // v3 puts this section's name blob first; skip past it to reach the way count, and
+    // remember where it started so a label id can be turned into a file offset later.
+    uint32_t sectionNameBase = 0;
+    if (formatVer >= kFormatV3) {
+        const uint32_t blobLen = rd32(hdr);
+        sectionNameBase = e.off + 4;
+        if (!mapSeek(f, sectionNameBase + blobLen) || mapRead(f, hdr, 4) != 4)
+            return;
+    }
     const uint32_t nWays = rd32(hdr);
+    const uint8_t ptBytes = (formatVer >= kFormatV3) ? 8 : 4;
 
     for (uint32_t w = 0; w < nWays; w++) {
         uint8_t wh[5];
@@ -370,13 +388,16 @@ void drawSection(OLEDDisplay *display, File &f, const Entry &e, const BaseMap::T
         bool first = true;
         uint16_t remaining = npts;
         while (remaining) {
-            const uint16_t chunk = remaining < kPtsPerRead ? remaining : kPtsPerRead;
-            const size_t want = (size_t)chunk * 4;
+            const uint16_t perRead = (uint16_t)(kWindow / ptBytes);
+            const uint16_t chunk = remaining < perRead ? remaining : perRead;
+            const size_t want = (size_t)chunk * ptBytes;
             if (mapRead(f, win, want) != want)
                 return;
             for (uint16_t i = 0; i < chunk; i++) {
-                const float ee = (float)rdi16(win + i * 4) + t.offsetE - t.panEastM;
-                const float nn = (float)rdi16(win + i * 4 + 2) + t.offsetN - t.panNorthM;
+                const int32_t rawE = (ptBytes == 8) ? (int32_t)rd32(win + i * 8) : (int32_t)rdi16(win + i * 4);
+                const int32_t rawN = (ptBytes == 8) ? (int32_t)rd32(win + i * 8 + 4) : (int32_t)rdi16(win + i * 4 + 2);
+                const float ee = (float)rawE + t.offsetE - t.panEastM;
+                const float nn = (float)rawN + t.offsetN - t.panNorthM;
                 const int32_t sx = t.cx + (int32_t)lroundf(ee * inv);
                 const int32_t sy = t.cy - (int32_t)lroundf(nn * inv);
                 if (!first) {
@@ -401,7 +422,8 @@ void drawSection(OLEDDisplay *display, File &f, const Entry &e, const BaseMap::T
         if (wantName && bestSeg > 0) {
             if (totalRun > 0xFFFF)
                 totalRun = 0xFFFF;
-            cands[nCands++] = {nameId, (int16_t)bestX, (int16_t)bestY, (uint16_t)totalRun, layer};
+            const uint32_t nameRef = (formatVer >= kFormatV3) ? (sectionNameBase + nameId) : (uint32_t)nameId;
+            cands[nCands++] = {nameRef, (int16_t)bestX, (int16_t)bestY, (uint16_t)totalRun, layer};
         }
     }
 }
@@ -454,11 +476,12 @@ bool BaseMap::begin()
         mapClose(f);
         return false;
     }
-    if (memcmp(hdr, "MBM1", 4) != 0 || hdr[4] != kFormatVersion) {
+    if (memcmp(hdr, "MBM1", 4) != 0 || (hdr[4] != kFormatV2 && hdr[4] != kFormatV3)) {
         LOG_WARN("BaseMap: bad magic/version in %s", kPath);
         mapClose(f);
         return false;
     }
+    formatVer = hdr[4];
     grid = hdr[5];
     if (grid == 0 || grid > kMaxGrid) {
         LOG_WARN("BaseMap: grid %u unsupported (max %u)", grid, kMaxGrid);
@@ -513,7 +536,8 @@ void BaseMap::reserve(int16_t x, int16_t y, int16_t w, int16_t h)
 
 void BaseMap::drawLabels(OLEDDisplay *display, const Transform &t)
 {
-    if (!ok || nCands == 0 || nameLen == 0 || t.mPerPx > kLabelZoomMPerPx)
+    // nameLen is only meaningful for v2; v3 keeps names per section and leaves it zero.
+    if (!ok || nCands == 0 || (formatVer < kFormatV3 && nameLen == 0) || t.mPerPx > kLabelZoomMPerPx)
         return;
 
     // Rank: major roads first, then by how much of the road is on screen. Selection sort -
@@ -570,8 +594,10 @@ void BaseMap::drawLabels(OLEDDisplay *display, const Transform &t)
         if (dupe)
             continue;
 
-        // name id is the byte offset of a length-prefixed string inside the blob
-        if (!mapSeek(f, nameOff + c.nameId))
+        // v2: offset into the one global blob. v3: already an absolute file offset, since
+        // the name lives in its own section's blob.
+        const uint32_t at = (formatVer >= kFormatV3) ? c.nameId : (nameOff + c.nameId);
+        if (!mapSeek(f, at))
             break;
         uint8_t len = 0;
         if (mapRead(f, &len, 1) != 1 || len == 0 || len >= kNameMax)
