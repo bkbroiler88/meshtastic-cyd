@@ -1,0 +1,35 @@
+{
+  "name": "tool-scons",
+  "version": "4.41101.0",
+  "description": "SCons software construction tool",
+  "keywords": [
+    "build tools",
+    "build system",
+    "make",
+    "cmake",
+    "ninja",
+    "bazel",
+    "mason"
+  ],
+  "homepage": "http://www.scons.org",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SCons/scons.git"
+  },
+  "export": {
+    "include": [
+      "**/*.py",
+      "CHANGES.txt",
+      "LICENSE",
+      "README.rst"
+    ],
+    "exclude": [
+      ".piopm",
+      "**/__pycache__",
+      "**/SCons/Tool/docbook",
+      "**/SCons/Tool/MSCommon",
+      "**/SCons/Tool/ninja"
+    ]
+  }
+}
