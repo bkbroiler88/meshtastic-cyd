@@ -98,6 +98,16 @@ class Router : protected concurrency::OSThread, protected PacketHistory
     [[nodiscard]] meshtastic_QueueStatus getQueueStatus();
 
     /**
+     * The ack proof verdict sniffReceived() reached for this packet, or ACK_PROOF_ABSENT when it
+     * reached none. Only valid until the next packet is sniffed.
+     */
+    virtual meshtastic_MeshPacket_AckProofStatus ackProofStatusFor(const meshtastic_MeshPacket &p) const
+    {
+        (void)p;
+        return meshtastic_MeshPacket_AckProofStatus_ACK_PROOF_ABSENT;
+    }
+
+    /**
      * @return our local nodenum */
     [[nodiscard]] NodeNum getNodeNum();
 
@@ -171,7 +181,7 @@ class Router : protected concurrency::OSThread, protected PacketHistory
      * Send an ack or a nak packet back towards whoever sent idFrom
      */
     void sendAckNak(meshtastic_Routing_Error err, NodeNum to, PacketId idFrom, ChannelIndex chIndex, uint8_t hopLimit = 0,
-                    bool ackWantsAck = false);
+                    bool ackWantsAck = false, const meshtastic_MeshPacket *relaySource = nullptr);
 
   private:
     /**
