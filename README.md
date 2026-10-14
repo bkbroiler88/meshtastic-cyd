@@ -20,6 +20,22 @@ street names, and battery sensing.
 
 ## Flash it
 
+**Easiest: flash from your browser.** Open the [web flasher](https://bkbroiler88.github.io/meshtastic-cyd/)
+in Chrome or Edge, pick your panel, and click Install. No tools to install. (Firefox and
+Safari lack Web Serial, and GitHub Pages must be enabled on this repo for the link to work.)
+
+Or use `esptool` from the command line, below.
+
+### Versions
+
+| Version | Built from |
+|---|---|
+| `2.8.1.1aae089` | Meshtastic 2.8.1 + this fork. Current. |
+| `2.8.0.21d15f6` | previous release, kept for rollback |
+
+The ILI9341 `2.8.1` image is **built but not yet verified on hardware** - if the screen
+misbehaves, try the ST7789 image, which is tested.
+
 Pick the image that matches your panel controller. These boards ship with either
 one under the same product name, and there is no way to detect it — the wrong
 image gives a garbled, mirrored or blank screen.
@@ -33,7 +49,7 @@ image gives a garbled, mirrored or blank screen.
 pip install esptool
 esptool --chip esp32 --port COM3 --baud 460800 write-flash \
   --flash-mode dio --flash-freq 40m --flash-size 4MB \
-  0x0 bins/firmware-lcdwiki_2_8_e22_st7789-2.8.0.21d15f6.factory.bin
+  0x0 bins/firmware-lcdwiki_2_8_e22_st7789-2.8.1.1aae089.factory.bin
 ```
 
 Write it at `0x0`: these are complete images including the bootloader and

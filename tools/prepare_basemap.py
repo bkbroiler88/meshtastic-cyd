@@ -28,7 +28,11 @@ import urllib.error
 import urllib.request
 
 MAGIC = b"MBM1"
-FORMAT_VERSION = 2  # v2 adds street names: a name blob plus a 2-byte id on every way
+# v2 added street names: one global blob plus a 2-byte id on every way.
+# v3 makes each section self-contained - its own name blob - and widens points to i32.
+# That lifts both of v2's ceilings: a 65 km box (i16 metres from the file origin) and
+# 64 KiB of names in total (u16 ids into one blob). Neither was a property of the board.
+FORMAT_VERSION = 3
 
 # A name id is the byte offset of its length-prefixed string inside the name blob, so a
 # lookup is one seek and one read. That caps the blob at 64 KiB, which is far more than a
@@ -101,7 +105,18 @@ out body geom;
 """
 
 
-def fetch(query):
+def fetch(query, cache_path=None):
+    """Query Overpass, optionally caching the raw response.
+
+    A wide box is tens of megabytes and the public endpoints time out often enough that
+    re-querying while tuning the packer is both slow and rude. The cache is keyed by the
+    caller, not the query, so change the box and you must change the cache file.
+    """
+    if cache_path and os.path.exists(cache_path):
+        sys.stderr.write(f"using cached response {cache_path}\n")
+        with open(cache_path, "rb") as f:
+            return json.loads(f.read())
+
     last_err = None
     for endpoint in OVERPASS_ENDPOINTS:
         for attempt in range(3):
@@ -119,6 +134,10 @@ def fetch(query):
                 with urllib.request.urlopen(req, timeout=300) as resp:
                     raw = resp.read()
                 sys.stderr.write(f"  got {len(raw) / 1024:.0f} KiB\n")
+                if cache_path:
+                    with open(cache_path, "wb") as f:
+                        f.write(raw)
+                    sys.stderr.write(f"  cached to {cache_path}\n")
                 return json.loads(raw)
             except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
                 last_err = e
@@ -139,7 +158,7 @@ def classify(tags):
     return None
 
 
-def project_all(elements, lat0, lon0):
+def project_all(elements, lat0, lon0, name_min_len=0.0):
     """Equirectangular to metres east/north of the origin - the same projection the
     firmware uses, so points land exactly where the renderer expects them."""
     m_per_deg_lat = 111132.0
@@ -154,16 +173,51 @@ def project_all(elements, lat0, lon0):
             continue
         # Only roads carry a name - water is never labelled, and leaving those names out
         # keeps the blob inside its 64 KiB addressing.
-        name = ""
-        if layer != LAYER_WATER:
-            name = (tags.get("name") or tags.get("ref") or "")[:NAME_MAX_BYTES]
+        name = road_label(tags, layer) if layer != LAYER_WATER else ""
         pts = [
             ((g["lon"] - lon0) * m_per_deg_lon, (g["lat"] - lat0) * m_per_deg_lat)
             for g in el["geometry"]
         ]
-        if len(pts) >= 2:
-            out.append((layer, name, pts))
+        if len(pts) < 2:
+            continue
+        # A wide box carries tens of thousands of distinct residential street names and the
+        # blob is addressed by uint16, so it overruns its 64 KiB id space long before the
+        # geometry becomes a problem. Short stubs are what fill it, and they are the names
+        # least likely to be wanted: drop the name, keep the road drawn.
+        if name_min_len > 0 and layer == LAYER_LOCAL:
+            length = sum(math.dist(a, b) for a, b in zip(pts, pts[1:]))
+            if length < name_min_len:
+                name = ""
+        out.append((layer, name, pts))
     return out
+
+
+def compact_ref(ref):
+    """"I 95" -> "I-95", "US 40;US 1" -> "US-40". First ref only; a shield shows one number."""
+    first = ref.split(";")[0].strip()
+    return "-".join(first.split())
+
+
+def road_label(tags, layer):
+    """The label a driver would actually recognise, which is not always OSM's `name`.
+
+    Big roads carry the number in `ref` and a ceremonial name in `name`: I-95 through
+    Maryland is "John F. Kennedy Memorial Highway". Preferring `name` there is wrong twice
+    over - nobody calls it that, and at ~35 characters it is wider than the 240 px screen,
+    so the firmware's "road must show 0.8x the label width" rule can never place it and the
+    motorway ends up with no label at all at any zoom. Take `ref` for the classes that have
+    one, `name` for the streets that do not.
+
+    It also makes stitch() work better: consecutive segments of an interstate share one ref
+    but often differ in `name`, and stitch joins on (layer, name).
+    """
+    ref = (tags.get("ref") or "").strip()
+    name = (tags.get("name") or "").strip()
+    if layer == LAYER_MAJOR and ref:
+        label = compact_ref(ref)
+    else:
+        label = name or (compact_ref(ref) if ref else "")
+    return label[:NAME_MAX_BYTES]
 
 
 def stitch(ways):
@@ -290,7 +344,7 @@ def build_name_blob(ways_lists):
 
 
 def pack_ways(ways, name_ids):
-    """ways: list of (layer, name, pts). Returns packed bytes for one section."""
+    """v2: ways: list of (layer, name, pts). Returns packed bytes for one section."""
     buf = bytearray()
     buf += struct.pack("<I", len(ways))
     for layer, name, pts in ways:
@@ -301,6 +355,40 @@ def pack_ways(ways, name_ids):
     return bytes(buf)
 
 
+def pack_section_v3(ways):
+    """One self-contained section: its own names, then its ways.
+
+        u32 nameLen
+        <nameLen bytes>      length-prefixed strings
+        u32 wayCount
+        ways: u8 layer, u16 npts, u16 nameId, npts * (i32 x, i32 y)
+
+    nameId is a byte offset inside THIS section's blob, which is why the 64 KiB name
+    ceiling disappears: a cell holds a few hundred names, not a whole county's worth.
+    Points are i32 metres from the file origin - v2's i16 capped a map at a 65 km box,
+    and doubling the coordinate is the cheapest way to lift that. It costs file size on
+    an SD card, which is the one resource here that is not scarce.
+    """
+    seen, blob, ids = set(), bytearray(), {}
+    for _, name, _ in ways:
+        if name and name not in seen:
+            seen.add(name)
+            enc = name.encode("utf-8")[:NAME_MAX_BYTES]
+            ids[name] = len(blob)
+            blob += bytes([len(enc)]) + enc
+
+    buf = bytearray()
+    buf += struct.pack("<I", len(blob))
+    buf += blob
+    buf += struct.pack("<I", len(ways))
+    for layer, name, pts in ways:
+        nid = ids.get(name, NAME_NONE) if name else NAME_NONE
+        buf += struct.pack("<BHH", layer, len(pts), nid)
+        for x, y in pts:
+            buf += struct.pack("<ii", int(round(x)), int(round(y)))
+    return bytes(buf)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lat", type=float, required=True)
@@ -308,6 +396,9 @@ def main():
     ap.add_argument("--km", type=float, default=24.0, help="box width in km")
     ap.add_argument("--grid", type=int, default=8, help="detail cells per side")
     ap.add_argument("--no-local", action="store_true", help="skip residential streets")
+    ap.add_argument("--name-min-len", type=float, default=0.0,
+                    help="drop names from local roads shorter than this many metres; "
+                         "the name blob is uint16-addressed and a wide box overruns it")
     ap.add_argument("--overview-min-len", type=float, default=600.0,
                     help="drop overview lines shorter than this many metres")
     ap.add_argument("--out", required=True)
@@ -338,7 +429,7 @@ def main():
 
     elements = data.get("elements", [])
     sys.stderr.write(f"{len(elements)} elements\n")
-    raw = project_all(elements, args.lat, args.lon)
+    raw = project_all(elements, args.lat, args.lon, args.name_min_len)
     sys.stderr.write(f"{len(raw)} usable ways\n")
     raw = stitch(raw)
     sys.stderr.write(f"{len(raw)} after stitching\n")
@@ -387,9 +478,9 @@ def main():
             if cur_cell is not None and len(cur_pts) >= 2:
                 cells[cur_cell].append((layer, name, cur_pts))
 
-    name_blob, name_ids = build_name_blob([overview] + cells)
-    overview_blob = pack_ways(overview, name_ids)
-    cell_blobs = [pack_ways(c, name_ids) for c in cells]
+    overview_blob = pack_section_v3(overview)
+    cell_blobs = [pack_section_v3(c) for c in cells]
+    name_blob = b""  # v3 keeps names inside each section; nothing global is left
 
     header = bytearray()
     header += MAGIC
@@ -399,7 +490,8 @@ def main():
     header += struct.pack("<ii", int(round(args.lat * 1e7)), int(round(args.lon * 1e7)))
     header += struct.pack("<I", int(round(half_m)))
     header += struct.pack("<I", int(round(cell_m)))
-    # v2: name blob offset/len, filled in once the layout is known (header is 32 bytes)
+    # v2 put the global name blob's offset/len here. v3 has no global blob, so these stay
+    # zero - the field is kept only so the offset table still starts at byte 32.
     name_off_pos = len(header)
     header += struct.pack("<II", 0, 0)
 
@@ -416,9 +508,7 @@ def main():
         table += struct.pack("<II", off, len(blob))
         off += len(blob)
 
-    # the name blob sits after the sections
-    struct.pack_into("<II", header, name_off_pos, off, len(name_blob))
-    off += len(name_blob)
+    struct.pack_into("<II", header, name_off_pos, 0, 0)
 
     with open(args.out, "wb") as f:
         f.write(header)
@@ -431,14 +521,20 @@ def main():
     total = off
     ov_pts = sum(len(p) for _, _, p in overview)
     det_pts = sum(len(p) for c in cells for _, _, p in c)
-    nonempty = sum(1 for b in cell_blobs if len(b) > 4)
+    nonempty = sum(1 for b in cell_blobs if len(b) > 8)  # v3 empty = 4B names + 4B count
     named = sum(1 for c in cells for w in c if w[1])
     print(f"wrote {args.out}")
     print(f"  total      {total:,} bytes ({total / 1024:.0f} KiB)")
     print(f"  overview   {len(overview):,} ways / {ov_pts:,} pts / {len(overview_blob) / 1024:.0f} KiB")
     print(f"  detail     {sum(len(c) for c in cells):,} ways / {det_pts:,} pts across {nonempty}/{args.grid ** 2} cells")
     print(f"  largest cell {max(len(b) for b in cell_blobs) / 1024:.1f} KiB")
-    print(f"  names      {len(name_ids):,} distinct / {named:,} labelled ways / {len(name_blob) / 1024:.1f} KiB")
+    # v3 keeps names per section, so "distinct" is counted across the whole file and the
+    # per-section figure is what actually has to stay under the u16 id space.
+    all_names = {w[1] for sec in [overview] + cells for w in sec if w[1]}
+    name_bytes = sum(struct.unpack_from("<I", b, 0)[0] for b in [overview_blob] + cell_blobs)
+    worst = max(struct.unpack_from("<I", b, 0)[0] for b in [overview_blob] + cell_blobs)
+    print(f"  names      {len(all_names):,} distinct / {named:,} labelled ways / {name_bytes / 1024:.1f} KiB")
+    print(f"  worst section name blob {worst:,} B of {NAME_NONE:,} addressable")
 
 
 if __name__ == "__main__":

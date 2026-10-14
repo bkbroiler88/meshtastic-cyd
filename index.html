@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meshtastic CYD — Web Flasher</title>
+<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; min-height: 100vh;
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: #0f172a; color: #e8eaed;
+    display: flex; flex-direction: column; align-items: center;
+    padding: 40px 20px;
+  }
+  main { max-width: 640px; width: 100%; }
+  h1 { font-size: 1.6rem; margin: 0 0 .2em; }
+  .sub { color: #9aa3ad; margin: 0 0 2rem; }
+  .card {
+    background: #1e293b; border: 1px solid #334155; border-radius: 10px;
+    padding: 20px 22px; margin-bottom: 18px;
+  }
+  .card h2 { font-size: 1.1rem; margin: 0 0 .3em; }
+  .card p { color: #9aa3ad; margin: 0 0 1rem; font-size: .95rem; }
+  esp-web-install-button { --esp-tools-button-color: #0f172a; --esp-tools-button-text-color: #67ea94; }
+  .warn { background: #3a2a0a; border-color: #6b4e13; }
+  .warn b { color: #f2c75c; }
+  code { background: #0f172a; padding: 1px 6px; border-radius: 4px; font-size: .9em; }
+  footer { color: #6b747e; font-size: .85rem; margin-top: 2rem; text-align: center; }
+  a { color: #67ea94; }
+  .note { font-size: .85rem; color: #6b747e; margin-top: .6rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Meshtastic CYD — Web Flasher</h1>
+  <p class="sub">Flash the LCDWIKI 2.8" ESP32 + E22 build straight from your browser.
+     Use <b>Chrome</b> or <b>Edge</b> on desktop — Web Serial isn't available in Firefox or Safari.</p>
+
+  <div class="card">
+    <h2>ST7789 panel</h2>
+    <p>The common LCDWIKI 2.8" with the ST7789 controller. This is the build tested on hardware.</p>
+    <esp-web-install-button manifest="manifest-st7789.json"></esp-web-install-button>
+  </div>
+
+  <div class="card">
+    <h2>ILI9341 panel</h2>
+    <p>Same board with the ILI9341 controller. Interchangeable modules ship under one name;
+       pick this if ST7789 shows a blank or scrambled screen.</p>
+    <esp-web-install-button manifest="manifest-ili9341.json"></esp-web-install-button>
+    <p class="note">Built but not yet verified on hardware — if it misbehaves, try the ST7789 build.</p>
+  </div>
+
+  <div class="card warn">
+    <p><b>Installing erases the device.</b> Wi-Fi credentials, node name and channels are wiped;
+       reconfigure from the Meshtastic phone app over Bluetooth after flashing. Maps live on the
+       SD card and are untouched.</p>
+  </div>
+
+  <footer>
+    Version 2.8.1.1aae089 · fork of <a href="https://github.com/meshtastic/firmware">meshtastic/firmware</a> ·
+    not an official Meshtastic project.<br>
+    Prefer the command line? See the <a href="README.md">README</a> for esptool instructions.
+  </footer>
+</main>
+</body>
+</html>
