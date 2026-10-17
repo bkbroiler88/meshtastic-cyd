@@ -73,6 +73,14 @@ class TFTDisplay : public OLEDDisplay
 
     uint16_t *linePixelBuffer = nullptr;
     uint16_t *repaintChunkBuffer = nullptr;
+#ifndef OLEDDISPLAY_DOUBLE_BUFFER
+    // Built with OLEDDISPLAY_REDUCE_MEMORY there is no buffer_back to diff against. One 32-bit
+    // hash per 32-column tile of each 8-row page stands in for it - 2.4 KB at 320x480 instead
+    // of a 19.2 KB second framebuffer. See TFTDisplay::display().
+    uint32_t *tileHash = nullptr;
+    uint16_t tileCols = 0;
+    void rehashAllTiles();
+#endif
 };
 
 namespace graphics

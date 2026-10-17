@@ -851,6 +851,9 @@ class LGFX : public lgfx::LGFX_Device
     lgfx::Panel_ST7796 _panel_instance;
     lgfx::Bus_SPI _bus_instance;
     lgfx::Light_PWM _light_instance;
+#if defined(USE_XPT2046)
+    lgfx::Touch_XPT2046 _touch_instance;
+#endif
 
   public:
     LGFX(void)
@@ -919,6 +922,39 @@ class LGFX : public lgfx::LGFX_Device
 
             _light_instance.config(cfg);
             _panel_instance.setLight(&_light_instance); // Set the backlight on the panel.
+        }
+#endif
+
+#if defined(USE_XPT2046)
+        {
+            // XPT2046 touch SHARING the panel's SPI bus. Unlike the dedicated-pin ST7789
+            // path (spi_host = -1 bit-bang), the LCDWIKI 3.5" wires the XPT2046 onto the
+            // LCD's own HSPI pins (TOUCH_SCLK/MOSI/MISO == TFT_SCLK/MOSI/MISO), so touch
+            // runs on the same hardware SPI host and LovyanGFX arbitrates it against the
+            // panel via bus_shared. Matches cyd-bulb-controller's cyd35 (TFT_eSPI) wiring.
+            auto touch_cfg = _touch_instance.config();
+
+            touch_cfg.spi_host = ST7796_SPI_HOST; // share the panel's hardware SPI host
+            touch_cfg.pin_sclk = TOUCH_SCLK;
+            touch_cfg.pin_mosi = TOUCH_MOSI;
+            touch_cfg.pin_miso = TOUCH_MISO;
+            touch_cfg.pin_cs = TOUCH_CS;
+            // Polled, not interrupt-driven. Leaving pin_int set would make getTouchRaw()
+            // bail whenever the pin reads high, and GPIO34-39 have no internal pullup.
+            touch_cfg.pin_int = -1;
+            touch_cfg.freq = 2500000;    // XPT2046 max; the panel keeps SPI_FREQUENCY
+            touch_cfg.bus_shared = true; // arbitrate against the panel on the shared bus
+
+            // Raw ADC span the controller reports at the panel edges; the one-time 4-point
+            // runtime calibration refines these, so they are only a starting point.
+            touch_cfg.x_min = 300;
+            touch_cfg.x_max = 3900;
+            touch_cfg.y_min = 400;
+            touch_cfg.y_max = 3900;
+            touch_cfg.offset_rotation = 0;
+
+            _touch_instance.config(touch_cfg);
+            _panel_instance.setTouch(&_touch_instance);
         }
 #endif
 
@@ -1612,6 +1648,24 @@ namespace
 {
 static constexpr uint8_t kFullRepaintChunkRows = 8;
 
+#ifndef OLEDDISPLAY_DOUBLE_BUFFER
+// Width of one change-tracking tile, in columns. A tile is this many contiguous bytes of one
+// 8-row page of the 1-bit buffer, so a change anywhere in it repaints at most kTileCols x 8 px.
+static constexpr uint32_t kTileCols = 32;
+
+// FNV-1a. A 32-bit hash makes a missed change (two different tiles hashing equal) a ~2^-32
+// event per changed tile; a narrower one would leave visible stale pixels far more often.
+static inline uint32_t tileHashOf(const uint8_t *p, uint32_t n)
+{
+    uint32_t h = 2166136261u;
+    while (n--) {
+        h ^= *p++;
+        h *= 16777619u;
+    }
+    return h;
+}
+#endif
+
 static inline uint16_t getThemeDefaultOnColor()
 {
     return graphics::TFTPalette::White;
@@ -1678,8 +1732,29 @@ TFTDisplay::~TFTDisplay()
         free(repaintChunkBuffer);
         repaintChunkBuffer = nullptr;
     }
+#ifndef OLEDDISPLAY_DOUBLE_BUFFER
+    if (tileHash != nullptr) {
+        free(tileHash);
+        tileHash = nullptr;
+    }
+#endif
     memaudit::set("display", 0);
 }
+
+#ifndef OLEDDISPLAY_DOUBLE_BUFFER
+/// Record the whole 1-bit buffer as pushed - the hash equivalent of memcpy(buffer_back, buffer).
+void TFTDisplay::rehashAllTiles()
+{
+    const uint32_t pages = (displayHeight + 7) / 8;
+    for (uint32_t page = 0; page < pages; page++) {
+        const uint8_t *row = buffer + page * displayWidth;
+        for (uint32_t t = 0; t < tileCols; t++) {
+            const uint32_t x0 = t * kTileCols;
+            tileHash[page * tileCols + t] = tileHashOf(row + x0, min<uint32_t>(kTileCols, displayWidth - x0));
+        }
+    }
+}
+#endif
 
 // Write the buffer to the display memory
 void TFTDisplay::display(bool fromBlank)
@@ -1781,7 +1856,11 @@ void TFTDisplay::display(bool fromBlank)
             }
         }
 
+#ifdef OLEDDISPLAY_DOUBLE_BUFFER
         memcpy(buffer_back, buffer, displayBufferSize);
+#else
+        rehashAllTiles();
+#endif
         lastColorFrameSignature = colorFrameSignature;
         haveLastDefaults = true;
         lastDefaultOnColor = defaultOnColor;
@@ -1791,6 +1870,12 @@ void TFTDisplay::display(bool fromBlank)
     }
 #endif
 
+#ifndef OLEDDISPLAY_DOUBLE_BUFFER
+    int32_t scannedPage = -1;  // page whose tiles were last hashed this pass
+    bool pageDirty = false;    // any tile in scannedPage changed
+    uint32_t pageFirstX = 0;   // first column of the first changed tile
+    uint32_t pageLastX = 0;    // last column of the last changed tile
+#endif
     y = 0;
     while (y < displayHeight) {
         // Rows a direct drawer owns are never pushed from the 1-bit buffer; it draws all of
@@ -1802,6 +1887,50 @@ void TFTDisplay::display(bool fromBlank)
         y_byteIndex = (y / 8) * displayWidth;
         y_byteMask = (1 << (y & 7));
 
+#ifndef OLEDDISPLAY_DOUBLE_BUFFER
+        // Steps 1+2 without a back buffer. Hash every tile of this row's page once, on the first
+        // row of the page this pass reaches (not necessarily row 0 of it - reserved rows can push
+        // the entry point mid-page). Committing the new hashes straight away is the analogue of
+        // the memcpy into buffer_back: it records reserved rows as pushed too, and a released
+        // reservation forces a full repaint that re-hashes everything.
+        if (static_cast<int32_t>(y / 8) != scannedPage) {
+            scannedPage = y / 8;
+            pageDirty = false;
+            uint32_t *hashes = tileHash + scannedPage * tileCols;
+            for (uint32_t t = 0; t < tileCols; t++) {
+                const uint32_t x0 = t * kTileCols;
+                const uint32_t n = min<uint32_t>(kTileCols, displayWidth - x0);
+                const uint8_t *src = buffer + y_byteIndex + x0;
+                const uint32_t h = tileHashOf(src, n);
+                bool dirty;
+                if (forceFullRepaint) {
+                    // The panel was just cleared to background: only tiles with set pixels matter.
+                    dirty = false;
+                    for (uint32_t i = 0; i < n && !dirty; i++)
+                        dirty = src[i] != 0;
+                } else {
+                    dirty = h != hashes[t];
+                }
+                hashes[t] = h;
+                if (dirty) {
+                    if (!pageDirty)
+                        pageFirstX = x0;
+                    pageLastX = x0 + n - 1;
+                    pageDirty = true;
+                }
+            }
+        }
+        if (!pageDirty) {
+            y = (scannedPage + 1) * 8; // nothing changed in this page - skip its remaining rows
+            continue;
+        }
+        // Every row of a changed page pushes the page's changed span. Rows inside it that did not
+        // change are rewritten with the colour they already have, so nothing visibly flashes.
+        {
+            const uint32_t x_FirstChanged = pageFirstX;
+            const uint32_t x_LastChanged = pageLastX;
+            (void)dblbuf_isset;
+#else
         // Step 1: Do a quick scan of 8 rows together. This allows fast-forwarding over unchanged screen areas.
         if (y_byteMask == 1) {
             if (!forceFullRepaint) {
@@ -1853,6 +1982,7 @@ void TFTDisplay::display(bool fromBlank)
                 }
                 x_LastChanged--;
             }
+#endif
 
             // Align the first pixel for update to an even number so the total alignment of
             // the data will be at 32-bit boundary, which is required by GDMA SPI transfers.
@@ -1960,9 +2090,13 @@ void TFTDisplay::display(bool fromBlank)
         }
         y++;
     }
+#ifdef OLEDDISPLAY_DOUBLE_BUFFER
     // Copy the Buffer to the Back Buffer
     if (somethingChanged)
         memcpy(buffer_back, buffer, displayBufferSize);
+#else
+    (void)somethingChanged; // tile hashes are committed per page as each page is scanned
+#endif
 
 #if GRAPHICS_TFT_COLORING_ENABLED
     lastColorFrameSignature = colorFrameSignature;
@@ -2448,6 +2582,19 @@ bool TFTDisplay::connect()
         }
         memaudit::add("display", sizeof(uint16_t) * displayWidth * kFullRepaintChunkRows);
     }
+#ifndef OLEDDISPLAY_DOUBLE_BUFFER
+    if (this->tileHash == NULL) {
+        tileCols = (displayWidth + kTileCols - 1) / kTileCols;
+        const size_t tiles = static_cast<size_t>(tileCols) * ((displayHeight + 7) / 8);
+        // Zero-filled: no real tile hashes to 0 in practice, so the first display() repaints all.
+        this->tileHash = (uint32_t *)calloc(tiles, sizeof(uint32_t));
+        if (!this->tileHash) {
+            LOG_ERROR("Not enough memory to create TFT tile hashes");
+            return false;
+        }
+        memaudit::add("display", tiles * sizeof(uint32_t));
+    }
+#endif
     return true;
 }
 

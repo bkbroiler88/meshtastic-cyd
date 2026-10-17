@@ -7,6 +7,7 @@
 
 #include "concurrency/OSThread.h"
 #include "main.h"
+#include "memGet.h"
 #include "mesh/PhoneAPI.h"
 #include "mesh/Throttle.h"
 #include "mesh/mesh-pb-constants.h"
@@ -920,7 +921,12 @@ void NimbleBluetooth::setup()
     purgeIncompatibleBleBonds(); // wipe bonds left in an incompatible on-disk format (post-upgrade)
 #endif
 
+    // BLEDevice::init() waits for host/controller sync with no timeout, so a stack that cannot
+    // allocate what it needs hangs here silently instead of failing. Log the budget it starts
+    // with: largest free block, not total, is what the host task's stack has to fit in.
+    LOG_INFO("BLE init heap: free=%u largest=%u", memGet.getFreeHeap(), memGet.getMaxAllocHeap());
     BLEDevice::init(getDeviceName());
+    LOG_INFO("BLE after init heap: free=%u largest=%u", memGet.getFreeHeap(), memGet.getMaxAllocHeap());
     BLEDevice::setPower(ESP_PWR_LVL_P9);
 
     int mtuResult = BLEDevice::setMTU(kPreferredBleMtu);
