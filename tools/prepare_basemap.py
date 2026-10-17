@@ -401,6 +401,9 @@ def main():
                          "the name blob is uint16-addressed and a wide box overruns it")
     ap.add_argument("--overview-min-len", type=float, default=600.0,
                     help="drop overview lines shorter than this many metres")
+    ap.add_argument("--format", type=int, choices=[2, 3], default=3,
+                    help="basemap version: 3 (per-section names, i32 pts, no size limit) or "
+                         "2 (one global name blob, i16 pts, <=65 km box and <=64 KiB names) for older firmware")
     ap.add_argument("--out", required=True)
     ap.add_argument("--cache", help="reuse/save the raw Overpass JSON here")
     args = ap.parse_args()
@@ -478,13 +481,19 @@ def main():
             if cur_cell is not None and len(cur_pts) >= 2:
                 cells[cur_cell].append((layer, name, cur_pts))
 
-    overview_blob = pack_section_v3(overview)
-    cell_blobs = [pack_section_v3(c) for c in cells]
-    name_blob = b""  # v3 keeps names inside each section; nothing global is left
+    if args.format == 3:
+        overview_blob = pack_section_v3(overview)
+        cell_blobs = [pack_section_v3(c) for c in cells]
+        name_blob = b""  # v3 keeps names inside each section; nothing global is left
+    else:
+        # v2: one global name blob, i16 points. Older firmware reads only this layout.
+        name_blob, name_ids = build_name_blob([overview] + cells)
+        overview_blob = pack_ways(overview, name_ids)
+        cell_blobs = [pack_ways(c, name_ids) for c in cells]
 
     header = bytearray()
     header += MAGIC
-    header += struct.pack("<B", FORMAT_VERSION)
+    header += struct.pack("<B", args.format)
     header += struct.pack("<B", args.grid)
     header += struct.pack("<H", 0)  # pad, keeps the offset table 4-byte aligned
     header += struct.pack("<ii", int(round(args.lat * 1e7)), int(round(args.lon * 1e7)))
@@ -508,7 +517,11 @@ def main():
         table += struct.pack("<II", off, len(blob))
         off += len(blob)
 
-    struct.pack_into("<II", header, name_off_pos, 0, 0)
+    if args.format == 3:
+        struct.pack_into("<II", header, name_off_pos, 0, 0)  # v3 has no global blob
+    else:
+        struct.pack_into("<II", header, name_off_pos, off, len(name_blob))  # v2 blob after sections
+        off += len(name_blob)
 
     with open(args.out, "wb") as f:
         f.write(header)
@@ -531,10 +544,15 @@ def main():
     # v3 keeps names per section, so "distinct" is counted across the whole file and the
     # per-section figure is what actually has to stay under the u16 id space.
     all_names = {w[1] for sec in [overview] + cells for w in sec if w[1]}
-    name_bytes = sum(struct.unpack_from("<I", b, 0)[0] for b in [overview_blob] + cell_blobs)
-    worst = max(struct.unpack_from("<I", b, 0)[0] for b in [overview_blob] + cell_blobs)
-    print(f"  names      {len(all_names):,} distinct / {named:,} labelled ways / {name_bytes / 1024:.1f} KiB")
-    print(f"  worst section name blob {worst:,} B of {NAME_NONE:,} addressable")
+    if args.format == 3:
+        name_bytes = sum(struct.unpack_from("<I", b, 0)[0] for b in [overview_blob] + cell_blobs)
+        worst = max(struct.unpack_from("<I", b, 0)[0] for b in [overview_blob] + cell_blobs)
+        print(f"  names      {len(all_names):,} distinct / {named:,} labelled ways / {name_bytes / 1024:.1f} KiB")
+        print(f"  worst section name blob {worst:,} B of {NAME_NONE:,} addressable")
+    else:
+        print(f"  names      {len(all_names):,} distinct / {named:,} labelled ways / {len(name_blob) / 1024:.1f} KiB")
+        if len(name_blob) > NAME_NONE:
+            print(f"  WARNING: global name blob {len(name_blob):,} B exceeds the {NAME_NONE:,} B v2 limit; raise --name-min-len")
 
 
 if __name__ == "__main__":
