@@ -2,6 +2,7 @@
 #if HAS_SCREEN
 #include "ProtobufModule.h"
 #include "input/InputBroker.h"
+#include "graphics/draw/TouchKeyboard.h"
 
 // ============================
 //        Enums & Defines
@@ -179,6 +180,11 @@ class CannedMessageModule : public SinglePortModule, public Observable<const UIF
 #if defined(USE_VIRTUAL_KEYBOARD)
     bool shift = false;
     int charSet = 0; // 0=ABC, 1=123
+#endif
+#if HAS_COLOR_KEYBOARD
+    // Full-colour keyboard drawn straight to the panel; the mono one above is the fallback.
+    graphics::TouchKeyboard colorKeyboard;
+    bool handleColorKeyboardTouch(int16_t x, int16_t y);
 #endif
 
     void updateState(cannedMessageModuleRunState, bool shouldRequestFocus = false);

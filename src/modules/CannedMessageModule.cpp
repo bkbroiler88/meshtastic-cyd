@@ -543,6 +543,14 @@ int CannedMessageModule::handleInputEvent(const InputEvent *event)
 
 void CannedMessageModule::updateState(cannedMessageModuleRunState newState, bool shouldRequestFocus)
 {
+#if HAS_COLOR_KEYBOARD
+    if (runState == CANNED_MESSAGE_RUN_STATE_FREETEXT && newState != CANNED_MESSAGE_RUN_STATE_FREETEXT) {
+        colorKeyboard.release();
+    } else if (runState != CANNED_MESSAGE_RUN_STATE_FREETEXT && newState == CANNED_MESSAGE_RUN_STATE_FREETEXT) {
+        colorKeyboard.shift = false;
+        colorKeyboard.symbols = false;
+    }
+#endif
     runState = newState;
     if (runState == CANNED_MESSAGE_RUN_STATE_FREETEXT) {
         inputBroker->menuMode =
@@ -828,12 +836,112 @@ bool CannedMessageModule::handleMessageSelectorInput(const InputEvent *event, bo
 
     return handled;
 }
+#if HAS_COLOR_KEYBOARD
+// One touch on the colour keyboard. Edits are applied here and only ask for a redraw: going
+// through runOnce() would regenerate the whole frameset on every keypress, which is what made
+// typing lag. Sending still goes through runOnce(), so the send path stays in one place.
+bool CannedMessageModule::handleColorKeyboardTouch(int16_t x, int16_t y)
+{
+    using Action = graphics::TouchKeyboard::Action;
+    const auto hit = colorKeyboard.hitTest(x, y, this->freetext.c_str(), this->cursor);
+    const unsigned int maxChars = 200 - (moduleConfig.canned_message.send_bell ? 1 : 0);
+    if (this->cursor > this->freetext.length())
+        this->cursor = this->freetext.length();
+
+    auto insert = [&](const String &str) {
+        this->freetext = this->freetext.substring(0, this->cursor) + str + this->freetext.substring(this->cursor);
+        this->cursor += str.length();
+        if (this->freetext.length() > maxChars) {
+            this->freetext = this->freetext.substring(0, maxChars);
+            this->cursor = min<unsigned int>(this->cursor, maxChars);
+        }
+    };
+
+    switch (hit.action) {
+    case Action::Char:
+        insert(String(hit.ch));
+        colorKeyboard.shift = false;
+        break;
+    case Action::Space:
+        insert(" ");
+        colorKeyboard.shift = false;
+        break;
+    case Action::Backspace:
+        if (this->cursor > 0) {
+            this->freetext.remove(this->cursor - 1, 1);
+            this->cursor--;
+        }
+        break;
+    case Action::Shift:
+        colorKeyboard.shift = !colorKeyboard.shift;
+        break;
+    case Action::Layer:
+        colorKeyboard.symbols = !colorKeyboard.symbols;
+        colorKeyboard.shift = false;
+        break;
+    case Action::Suggestion: {
+        // Replace the partial word before the cursor with the suggestion and a space.
+        const unsigned int from = min<unsigned int>(hit.cursor, this->cursor);
+        this->freetext.remove(from, this->cursor - from);
+        this->cursor = from;
+        insert(String(hit.word) + " ");
+        colorKeyboard.shift = false;
+        break;
+    }
+    case Action::Cursor:
+        this->cursor = min<unsigned int>(hit.cursor, this->freetext.length());
+        break;
+    case Action::Send:
+        updateState(CANNED_MESSAGE_RUN_STATE_ACTION_SELECT);
+        payload = CANNED_MESSAGE_RUN_STATE_FREETEXT;
+        currentMessageIndex = -1;
+        colorKeyboard.shift = false;
+        lastTouchMillis = millis();
+        runOnce();
+        payload = 0;
+        return true;
+    case Action::Cancel: {
+        // Close without sending; the draft is discarded.
+        updateState(CANNED_MESSAGE_RUN_STATE_INACTIVE);
+        freetext = "";
+        cursor = 0;
+        payload = 0;
+        currentMessageIndex = -1;
+        UIFrameEvent e;
+        e.action = UIFrameEvent::Action::REGENERATE_FRAMESET;
+        notifyObservers(&e);
+        if (screen)
+            screen->forceDisplay();
+        return true;
+    }
+    case Action::None:
+        return true; // the header or a margin: nothing to do, but the touch was ours
+    }
+
+    lastTouchMillis = millis();
+    UIFrameEvent e;
+    e.action = UIFrameEvent::Action::REDRAW_ONLY;
+    notifyObservers(&e);
+    return true;
+}
+#endif
+
 bool CannedMessageModule::handleFreeTextInput(const InputEvent *event)
 {
     // Always process only if in FREETEXT mode
     if (runState != CANNED_MESSAGE_RUN_STATE_FREETEXT)
         return false;
 
+#if HAS_COLOR_KEYBOARD
+    // While the colour keyboard is up, every touch gesture is a keystroke or nothing. A
+    // long-press would otherwise send the draft (SELECT) and a sloppy sideways tap would
+    // discard it (swipe left = cancel); the keyboard has its own Send and close keys.
+    if (colorKeyboard.active() && (event->touchX != 0 || event->touchY != 0)) {
+        if (event->inputEvent == INPUT_BROKER_USER_PRESS || event->inputEvent == INPUT_BROKER_SELECT)
+            return handleColorKeyboardTouch(event->touchX, event->touchY);
+        return true;
+    }
+#endif
 #if defined(USE_VIRTUAL_KEYBOARD)
     // Cancel (dismiss freetext screen)
     if (event->inputEvent == INPUT_BROKER_LEFT) {
@@ -1246,7 +1354,13 @@ int32_t CannedMessageModule::runOnce()
         this->cursor = 0;
         return INT32_MAX;
     } else if (((this->runState == CANNED_MESSAGE_RUN_STATE_ACTIVE) || (this->runState == CANNED_MESSAGE_RUN_STATE_FREETEXT)) &&
-               !Throttle::isWithinTimespanMs(this->lastTouchMillis, INACTIVATE_AFTER_MS)) {
+               !Throttle::isWithinTimespanMs(this->lastTouchMillis, INACTIVATE_AFTER_MS)
+#if HAS_COLOR_KEYBOARD
+               // A draft on the colour keyboard stays until it is sent or closed with its X: the
+               // timeout would discard it silently and hand the next tap to frame navigation.
+               && !(this->runState == CANNED_MESSAGE_RUN_STATE_FREETEXT && colorKeyboard.active())
+#endif
+    ) {
         // Reset module on inactivity
         e.action = UIFrameEvent::Action::REGENERATE_FRAMESET;
         this->currentMessageIndex = -1;
@@ -1508,6 +1622,20 @@ String CannedMessageModule::keyForCoordinates(uint x, uint y)
 
 void CannedMessageModule::drawKeyboard(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y)
 {
+#if HAS_COLOR_KEYBOARD
+    {
+        char header[64];
+        if (this->dest == NODENUM_BROADCAST)
+            snprintf(header, sizeof(header), "To: #%s", channels.getName(this->channel));
+        else
+            snprintf(header, sizeof(header), "To: @%s", getNodeName(this->dest));
+        const uint16_t maxChars = 200 - (moduleConfig.canned_message.send_bell ? 1 : 0);
+        const auto drawn = colorKeyboard.draw(this->freetext.c_str(), this->cursor, header, maxChars, display->getWidth(),
+                                              display->getHeight());
+        if (drawn != graphics::TouchKeyboard::DrawResult::Unavailable)
+            return; // drawn direct, or a banner owns the screen and must show through
+    }
+#endif
     int outerSize = *(&this->keyboard[this->charSet] + 1) - this->keyboard[this->charSet];
 
     // Inset the key grid horizontally by the body L/R margin (keeps touch aligned since

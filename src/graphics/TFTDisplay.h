@@ -121,15 +121,29 @@ void tftNoteFullRepaint();
  * So the band gets exactly one owner. Whoever reserves it draws all of it - background,
  * content and text - and no 1-bit UI may be placed inside it, because it will not be shown.
  * Pass y1 <= y0 to release.
+ *
+ * The reservation is a lease that lapses `leaseMs` after the owner's last call. The default
+ * suits an owner redrawn every frame; one that only redraws on input (the screen idles at
+ * 1 fps) needs a lease longer than that, and must release explicitly when it goes away.
  */
-void tftReserveDirectRows(int16_t y0, int16_t y1);
+void tftReserveDirectRows(int16_t y0, int16_t y1, uint32_t leaseMs = 500);
 void tftReleaseDirectRows();
 
 void tftDirectFillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color);
+void tftDirectFillRoundRect(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r, uint16_t color);
+void tftDirectFillTriangle(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t x2, int16_t y2, uint16_t color);
 void tftDirectLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color, uint8_t width = 1);
 void tftDirectCircle(int16_t x, int16_t y, int16_t r, uint16_t color, bool filled);
 /// Text with a solid background, which is what gives a label its halo over the map.
 void tftDirectText(int16_t x, int16_t y, const char *s, uint16_t fg, uint16_t bg);
 int16_t tftDirectTextWidth(const char *s);
 int16_t tftDirectTextHeight();
+
+/// Fonts for direct text beyond the panel's tiny default. Small is 16 px, Large 26 px.
+enum class TftFont : uint8_t { Small, Large };
+/// Text in `font`, anchored at its top-left or (centered) its middle. Restores the panel's
+/// previous font afterwards, so callers of tftDirectText() are unaffected.
+void tftDirectTextF(int16_t x, int16_t y, const char *s, uint16_t fg, uint16_t bg, TftFont font, bool centered = false);
+int16_t tftDirectTextWidthF(const char *s, TftFont font);
+int16_t tftDirectTextHeightF(TftFont font);
 } // namespace graphics

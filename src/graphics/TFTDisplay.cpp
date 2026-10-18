@@ -1781,8 +1781,18 @@ void TFTDisplay::display(bool fromBlank)
     const bool forceFullRepaint = fromBlank || themeDefaultsChanged;
 
     // If theme defaults changed, reset panel background immediately so stale pixels don't linger.
+    // Rows a direct drawer has reserved are left alone, the same rule the blit below follows.
     if (forceFullRepaint) {
-        tft->fillScreen(defaultOffColor);
+        const int16_t r0 = graphics::s_directRowStart;
+        const int16_t r1 = graphics::s_directRowEnd;
+        if (r1 > r0) {
+            if (r0 > 0)
+                tft->fillRect(0, 0, displayWidth, r0, defaultOffColor);
+            if (r1 < (int16_t)displayHeight)
+                tft->fillRect(0, r1, displayWidth, displayHeight - r1, defaultOffColor);
+        } else {
+            tft->fillScreen(defaultOffColor);
+        }
     }
 
     colorTftWhite = (defaultOnColor >> 8) | ((defaultOnColor & 0xFF) << 8);
@@ -2607,11 +2617,11 @@ void tftNoteFullRepaint()
     s_fullRepaints++;
 }
 
-void tftReserveDirectRows(int16_t y0, int16_t y1)
+void tftReserveDirectRows(int16_t y0, int16_t y1, uint32_t leaseMs)
 {
     s_directRowStart = y0;
     s_directRowEnd = y1;
-    s_directExpiry = millis() + 500; // refreshed every frame the owner draws
+    s_directExpiry = millis() + leaseMs; // refreshed every time the owner draws
 }
 
 /// Drop a lapsed reservation. Called once per blit, not per row.
@@ -2687,6 +2697,52 @@ int16_t tftDirectTextHeight()
 {
     return tft ? (int16_t)tft->fontHeight() : 8;
 }
+void tftDirectFillRoundRect(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r, uint16_t color)
+{
+    if (tft)
+        tft->fillRoundRect(x, y, w, h, r, color);
+}
+void tftDirectFillTriangle(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t x2, int16_t y2, uint16_t color)
+{
+    if (tft)
+        tft->fillTriangle(x0, y0, x1, y1, x2, y2, color);
+}
+static const lgfx::IFont *fontFor(TftFont font)
+{
+    return font == TftFont::Large ? (const lgfx::IFont *)&lgfx::fonts::Font4 : (const lgfx::IFont *)&lgfx::fonts::Font2;
+}
+void tftDirectTextF(int16_t x, int16_t y, const char *s, uint16_t fg, uint16_t bg, TftFont font, bool centered)
+{
+    if (!tft || !s)
+        return;
+    const lgfx::IFont *prev = tft->getFont();
+    tft->setFont(fontFor(font));
+    tft->setTextColor(fg, bg);
+    tft->setTextDatum(centered ? textdatum_t::middle_center : textdatum_t::top_left);
+    tft->drawString(s, x, y);
+    tft->setTextDatum(textdatum_t::top_left);
+    tft->setFont(prev);
+}
+int16_t tftDirectTextWidthF(const char *s, TftFont font)
+{
+    if (!tft || !s)
+        return 0;
+    const lgfx::IFont *prev = tft->getFont();
+    tft->setFont(fontFor(font));
+    const int16_t w = (int16_t)tft->textWidth(s);
+    tft->setFont(prev);
+    return w;
+}
+int16_t tftDirectTextHeightF(TftFont font)
+{
+    if (!tft)
+        return font == TftFont::Large ? 26 : 16;
+    const lgfx::IFont *prev = tft->getFont();
+    tft->setFont(fontFor(font));
+    const int16_t h = (int16_t)tft->fontHeight();
+    tft->setFont(prev);
+    return h;
+}
 
 #else
 
@@ -2705,6 +2761,17 @@ int16_t tftDirectTextWidth(const char *)
 int16_t tftDirectTextHeight()
 {
     return 8;
+}
+void tftDirectFillRoundRect(int16_t, int16_t, int16_t, int16_t, int16_t, uint16_t) {}
+void tftDirectFillTriangle(int16_t, int16_t, int16_t, int16_t, int16_t, int16_t, uint16_t) {}
+void tftDirectTextF(int16_t, int16_t, const char *, uint16_t, uint16_t, TftFont, bool) {}
+int16_t tftDirectTextWidthF(const char *, TftFont)
+{
+    return 0;
+}
+int16_t tftDirectTextHeightF(TftFont font)
+{
+    return font == TftFont::Large ? 26 : 16;
 }
 
 #endif
