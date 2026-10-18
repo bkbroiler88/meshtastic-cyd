@@ -66,6 +66,13 @@ class menuHandler
         ThemeMenu,
         HamModeConfirm,
         LicensedToNormalConfirm,
+#ifdef RADIO_TUNING_MENU
+        RadioTuningMenu,
+        TcxoDelayPicker,
+        AgcModePicker,
+        RxModePicker,
+        RadioDiagMenu,
+#endif
 #if HAS_LORA_FEM
         LoraFemLnaToggleMenu
 #endif
@@ -80,6 +87,13 @@ class menuHandler
     static void deviceRolePicker();
     static void radioPresetPicker();
     static void txEnabledMenu();
+#ifdef RADIO_TUNING_MENU
+    static void radioTuningMenu();
+    static void tcxoDelayPicker();
+    static void agcModePicker();
+    static void rxModePicker();
+    static void radioDiagMenu();
+#endif
     static void FrequencySlotPicker();
     static void handleMenuSwitch(OLEDDisplay *display);
     static void showConfirmationBanner(const char *message, std::function<void()> onConfirm);

@@ -26,6 +26,7 @@
 #endif
 #include "mesh/MeshTypes.h"
 #include "mesh/RadioLibInterface.h"
+#include "mesh/RadioTuning.h"
 #include "modules/AdminModule.h"
 #include "modules/CannedMessageModule.h"
 #if !MESHTASTIC_EXCLUDE_MQTT
@@ -169,6 +170,9 @@ void menuHandler::loraMenu()
 {
     static const char *optionsArray[] = {
         "Back",    "Device Role", "Radio Preset", "Frequency Slot", "LoRa Region", "Transmit Enabled",
+#ifdef RADIO_TUNING_MENU
+        "Radio Tuning",
+#endif
 #if HAS_LORA_FEM
         "FEM LNA",
 #endif
@@ -182,17 +186,21 @@ void menuHandler::loraMenu()
         FrequencySlot = 3,
         LoraPicker = 4,
         TxEnabled = 5,
-#if HAS_LORA_FEM
-        LoraFemLna = 6
+#ifdef RADIO_TUNING_MENU
+        RadioTuning,
 #endif
+#if HAS_LORA_FEM
+        LoraFemLna,
+#endif
+        OptionCount
     };
     BannerOverlayOptions bannerOptions;
     bannerOptions.message = "LoRa Actions";
     bannerOptions.optionsArrayPtr = optionsArray;
 #if HAS_LORA_FEM
-    bannerOptions.optionsCount = loraFEMInterface.isLnaCanControl() ? 7 : 6;
+    bannerOptions.optionsCount = loraFEMInterface.isLnaCanControl() ? OptionCount : OptionCount - 1;
 #else
-    bannerOptions.optionsCount = 6;
+    bannerOptions.optionsCount = OptionCount;
 #endif
     bannerOptions.bannerCallback = [](int selected) -> void {
         if (selected == Back) {
@@ -208,6 +216,11 @@ void menuHandler::loraMenu()
         } else if (selected == TxEnabled) {
             menuHandler::menuQueue = menuHandler::TXEnabledMenu;
         }
+#ifdef RADIO_TUNING_MENU
+        else if (selected == RadioTuning) {
+            menuHandler::menuQueue = menuHandler::RadioTuningMenu;
+        }
+#endif
 #if HAS_LORA_FEM
         else if (selected == LoraFemLna) {
             menuHandler::menuQueue = menuHandler::LoraFemLnaToggleMenu;
@@ -216,6 +229,145 @@ void menuHandler::loraMenu()
     };
     screen->showOverlayBanner(bannerOptions);
 }
+
+#ifdef RADIO_TUNING_MENU
+// LoRa Actions > Radio Tuning: three radio knobs kept in NVS by radiotune, each shown with its
+// current value and opening its own picker.
+void menuHandler::radioTuningMenu()
+{
+    static const char *const agcNames[] = {"When Idle", "Every Minute", "Daily Only"};
+    static char tcxoLine[32];
+    static char agcLine[32];
+    static char rxLine[32];
+    snprintf(tcxoLine, sizeof(tcxoLine), "TCXO Start-up: %u ms", (unsigned)((radiotune::tcxoDelayUs() + 500) / 1000));
+    snprintf(agcLine, sizeof(agcLine), "AGC Reset: %s", agcNames[(uint8_t)radiotune::agcMode()]);
+    snprintf(rxLine, sizeof(rxLine), "Receive: %s", radiotune::continuousRx() ? "Continuous" : "Power Saving");
+
+    static const char *optionsArray[] = {"Back", tcxoLine, agcLine, rxLine, "Diagnostics"};
+    enum optionsNumbers { Back = 0, Tcxo = 1, Agc = 2, Rx = 3, Diag = 4 };
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "Radio Tuning";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 5;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected == Diag) {
+            menuHandler::menuQueue = menuHandler::RadioDiagMenu;
+        } else if (selected == Tcxo) {
+            menuHandler::menuQueue = menuHandler::TcxoDelayPicker;
+        } else if (selected == Agc) {
+            menuHandler::menuQueue = menuHandler::AgcModePicker;
+        } else if (selected == Rx) {
+            menuHandler::menuQueue = menuHandler::RxModePicker;
+        } else {
+            menuHandler::menuQueue = menuHandler::LoraMenu;
+            screen->runNow();
+        }
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+
+void menuHandler::tcxoDelayPicker()
+{
+    static const char *optionsArray[] = {"Back", "1 ms (upstream)", "2 ms", "5 ms (2.8.0)", "10 ms"};
+    static const uint32_t delaysUs[] = {0, 1000, 2000, 5000, 10000};
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "TCXO Start-up";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 5;
+    bannerOptions.InitialSelected = 3;
+    for (int8_t i = 1; i < 5; i++)
+        if (delaysUs[i] == radiotune::tcxoDelayUs())
+            bannerOptions.InitialSelected = i;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected < 1 || selected > 4 || delaysUs[selected] == radiotune::tcxoDelayUs()) {
+            menuHandler::menuQueue = menuHandler::RadioTuningMenu;
+            screen->runNow();
+            return;
+        }
+        radiotune::setTcxoDelayUs(delaysUs[selected]);
+        // Programmed after begin(), so it only takes effect when the radio restarts.
+        menuHandler::showConfirmationBanner("Reboot to apply?", []() {
+            IF_SCREEN(screen->showSimpleBanner("Rebooting...", 0));
+            rebootAtMsec = Time::timerEndsAtMillis(DEFAULT_REBOOT_SECONDS * 1000);
+        });
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+
+void menuHandler::agcModePicker()
+{
+    static const char *optionsArray[] = {"Back", "When Idle", "Every Minute", "Daily Only"};
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "AGC Reset";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 4;
+    bannerOptions.InitialSelected = 1 + (uint8_t)radiotune::agcMode();
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected >= 1 && selected <= 3)
+            radiotune::setAgcMode((radiotune::AgcMode)(selected - 1)); // read on every maintenance tick
+        menuHandler::menuQueue = menuHandler::RadioTuningMenu;
+        screen->runNow();
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+
+void menuHandler::rxModePicker()
+{
+    static const char *optionsArray[] = {"Back", "Power Saving", "Continuous"};
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "Receive";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 3;
+    bannerOptions.InitialSelected = radiotune::continuousRx() ? 2 : 1;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected == 1 || selected == 2) {
+            const bool wanted = (selected == 2);
+            if (wanted != radiotune::continuousRx()) {
+                radiotune::setContinuousRx(wanted);
+                // Restart RX in the new mode now rather than at the next send or receive.
+                if (RadioLibInterface::instance)
+                    RadioLibInterface::instance->reconfigure();
+            }
+        }
+        menuHandler::menuQueue = menuHandler::RadioTuningMenu;
+        screen->runNow();
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+
+// Radio Tuning > Diagnostics: what the SX126x reported after each TX and at each standby failure /
+// re-init. The E22's external PA has no read-back; PA ramp here is the chip's own PA stage.
+void menuHandler::radioDiagMenu()
+{
+    static char message[200];
+    const radiotune::ChipStats &st = radiotune::chipStats();
+    const radiotune::ChipSnapshot &f = radiotune::lastFaultSnapshot();
+    int n = snprintf(message, sizeof(message), "Radio Diagnostics\nTX %lu  PA ramp err %lu\nStandby fail %lu  BUSY stuck %lu\nXOSC err %lu  seen 0x%04x\nAt boot 0x%04x",
+                     (unsigned long)st.txDone, (unsigned long)st.paRampErr, (unsigned long)st.standbyFail,
+                     (unsigned long)st.busyStuck, (unsigned long)st.xoscErr, st.errorsSeen, st.bootErrors);
+    if (f.atMs && n > 0 && n < (int)sizeof(message)) {
+        snprintf(message + n, sizeof(message) - n, "\nLast fault %lus ago: %s\n%s busy=%d err=0x%04x",
+                 (unsigned long)((Time::getMillis() - f.atMs) / 1000), f.where,
+                 f.answered ? radiotune::chipModeName(f.status) : "no answer", f.busyHigh, f.errors);
+    }
+
+    static const char *optionsArray[] = {"Back", "Clear"};
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = message;
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 2;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected == 1) {
+            if (RadioLibInterface::instance) // read + clear the chip's latched flags too
+                RadioLibInterface::instance->captureChipDiag("clear", radiotune::SnapKind::Boot);
+            radiotune::clearChipStats();
+        }
+        menuHandler::menuQueue = menuHandler::RadioTuningMenu;
+        screen->runNow();
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+#endif
 
 void menuHandler::OnboardMessage()
 {
@@ -3235,6 +3387,23 @@ void menuHandler::handleMenuSwitch(OLEDDisplay *display)
     case TXEnabledMenu:
         txEnabledMenu();
         break;
+#ifdef RADIO_TUNING_MENU
+    case RadioTuningMenu:
+        radioTuningMenu();
+        break;
+    case TcxoDelayPicker:
+        tcxoDelayPicker();
+        break;
+    case AgcModePicker:
+        agcModePicker();
+        break;
+    case RxModePicker:
+        rxModePicker();
+        break;
+    case RadioDiagMenu:
+        radioDiagMenu();
+        break;
+#endif
     case FrequencySlot:
         FrequencySlotPicker();
         break;

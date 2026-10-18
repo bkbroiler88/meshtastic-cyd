@@ -3,6 +3,7 @@
 #include "configuration.h"
 #include "error.h"
 #include "mesh/NodeDB.h"
+#include "mesh/RadioTuning.h"
 #ifdef ARCH_PORTDUINO
 #include "PortduinoGlue.h"
 #endif
@@ -12,6 +13,7 @@
 #endif
 
 #include "Throttle.h"
+#include "UptimeClock.h"
 
 // Particular boards might define a different max power based on what their hardware can do, default to max power output if not
 // specified (may be dangerous if using external PA and SX126x power config forgotten)
@@ -28,6 +30,10 @@ SX126xInterface<T>::SX126xInterface(LockingArduinoHal *hal, RADIOLIB_PIN_TYPE cs
     : RadioLibInterface(hal, cs, irq, rst, busy, &lora), lora(&module)
 {
     LOG_DEBUG("SX126xInterface(cs=%d, irq=%d, rst=%d, busy=%d)", cs, irq, rst, busy);
+#ifdef RADIO_TUNING_MENU
+    diagCs = cs;
+    diagBusy = busy;
+#endif
 }
 
 /// Initialise the Driver transport hardware and software.
@@ -102,6 +108,9 @@ template <typename T> bool SX126xInterface<T>::init()
     if (!reinitChip())
         return false;
     boundBusyWait();
+#ifdef RADIO_TUNING_MENU
+    captureChipDiag("boot", radiotune::SnapKind::Boot); // read + clear what begin() latched
+#endif
 
     startReceive(); // start receiving
 
@@ -404,6 +413,10 @@ template <typename T> int16_t SX126xInterface<T>::trySetStandby()
 
     if (err != RADIOLIB_ERR_NONE)
         LOG_DEBUG("SX126x standby %s%d", radioLibErr, err);
+#ifdef RADIO_TUNING_MENU
+    if (err != RADIOLIB_ERR_NONE)
+        captureChipDiag("standby-fail", radiotune::SnapKind::StandbyFail);
+#endif
 #ifdef ARCH_PORTDUINO
     if (err != RADIOLIB_ERR_NONE)
         portduino_status.LoRa_in_error = true;
@@ -415,6 +428,66 @@ template <typename T> int16_t SX126xInterface<T>::trySetStandby()
     RadioLibInterface::setStandby();
     return err;
 }
+
+#ifdef RADIO_TUNING_MENU
+template <typename T> void SX126xInterface<T>::captureChipDiag(const char *where, radiotune::SnapKind kind)
+{
+    radiotune::ChipSnapshot s;
+    s.atMs = Time::skipZero(Time::getMillis());
+    s.where = where;
+    RadioLibHal *hal = module.hal;
+    s.busyHigh = diagBusy != RADIOLIB_NC && hal->digitalRead(diagBusy);
+#if defined(SX126X_RXEN)
+    if (SX126X_RXEN != RADIOLIB_NC)
+        s.rxen = digitalRead(SX126X_RXEN);
+#endif
+
+    // Raw GetStatus, bypassing RadioLib's BUSY wait: the chip answers it even with BUSY high, and a
+    // stuck BUSY is exactly the case worth seeing. 0x00/0xFF means nothing drove MISO (asleep / dead).
+    if (diagCs != RADIOLIB_NC) {
+        uint8_t out[2] = {RADIOLIB_SX126X_CMD_GET_STATUS, RADIOLIB_SX126X_CMD_NOP};
+        uint8_t in[2] = {0, 0};
+        hal->spiBeginTransaction();
+        hal->digitalWrite(diagCs, hal->GpioLevelLow);
+        hal->spiTransfer(out, sizeof(out), in);
+        hal->digitalWrite(diagCs, hal->GpioLevelHigh);
+        hal->spiEndTransaction();
+        s.status = in[1];
+        s.answered = s.status != 0x00 && s.status != 0xFF;
+    }
+
+    // Everything else needs BUSY low; skip it rather than burn the BUSY timeout on a stuck chip
+    if (!s.busyHigh && s.answered) {
+        uint8_t e[2] = {0, 0};
+        if (module.SPIreadStream(RADIOLIB_SX126X_CMD_GET_DEVICE_ERRORS, e, 2, true, false) == RADIOLIB_ERR_NONE) {
+            s.errors = ((uint16_t)e[0] << 8) | e[1];
+            module.SPIreadRegisterBurst(RADIOLIB_SX126X_REG_OCP_CONFIGURATION, 1, &s.ocp);
+            module.SPIreadRegisterBurst(RADIOLIB_SX126X_REG_TX_CLAMP_CONFIG, 1, &s.txClamp);
+            module.SPIreadRegisterBurst(RADIOLIB_SX126X_REG_RX_GAIN, 1, &s.rxGain);
+            s.regsValid = true;
+            if (s.errors) {
+                // Latched until cleared - clear so the next snapshot shows only new errors
+                const uint8_t zero[2] = {RADIOLIB_SX126X_CMD_NOP, RADIOLIB_SX126X_CMD_NOP};
+                module.SPIwriteStream(RADIOLIB_SX126X_CMD_CLEAR_DEVICE_ERRORS, zero, 2, true, false);
+            }
+        }
+    }
+
+    radiotune::recordSnapshot(s, kind);
+
+    if ((kind == radiotune::SnapKind::TxDone || kind == radiotune::SnapKind::Boot) && !s.busyHigh && !s.errors) {
+        LOG_DEBUG("SX126x diag %s: status=0x%02x %s err=0x%04x ocp=0x%02x", where, s.status, radiotune::chipModeName(s.status),
+                  s.errors, s.ocp);
+        return;
+    }
+    LOG_WARN("SX126x diag %s: busy=%d status=0x%02x (%s, cmd=%u) err=0x%04x%s%s%s ocp=0x%02x clamp=0x%02x rxgain=0x%02x "
+             "rxen=%d",
+             where, s.busyHigh, s.status, s.answered ? radiotune::chipModeName(s.status) : "no answer", (s.status >> 1) & 0x07,
+             s.errors, (s.errors & RADIOLIB_SX126X_XOSC_START_ERR) ? " XOSC_START" : "",
+             (s.errors & RADIOLIB_SX126X_PA_RAMP_ERR) ? " PA_RAMP" : "", (s.errors & RADIOLIB_SX126X_PLL_LOCK_ERR) ? " PLL_LOCK" : "",
+             s.ocp, s.txClamp, s.rxGain, s.rxen);
+}
+#endif
 
 template <typename T> void SX126xInterface<T>::setStandby()
 {
@@ -458,19 +531,20 @@ template <typename T> void SX126xInterface<T>::startReceive()
     setTransmitEnable(false);
 
 #ifdef ARCH_PORTDUINO_WASM
-    const char *rxMethod = "startReceive";
+    // Continuous RX in the browser: duty-cycle sleep parks BUSY high between RX
+    // windows and stalls the slow WebUSB SPI link. No battery to save here.
+    constexpr bool continuous = true;
+#elif defined(RADIO_TUNING_MENU)
+    const bool continuous = radiotune::continuousRx(); // LoRa Actions > Radio Tuning > Receive
 #else
-    const char *rxMethod = "startReceiveDutyCycleAuto";
+    constexpr bool continuous = false;
 #endif
+    const char *rxMethod = continuous ? "startReceive" : "startReceiveDutyCycleAuto";
     auto tryStartRx = [&]() -> int16_t {
-#ifdef ARCH_PORTDUINO_WASM
-        // Continuous RX in the browser: duty-cycle sleep parks BUSY high between RX
-        // windows and stalls the slow WebUSB SPI link. No battery to save here.
-        return lora.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF, MESHTASTIC_RADIOLIB_IRQ_RX_FLAGS);
-#else
+        if (continuous)
+            return lora.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF, MESHTASTIC_RADIOLIB_IRQ_RX_FLAGS);
         // We use a 16 bit preamble so this should save some power by letting radio sit in standby mostly.
         return lora.startReceiveDutyCycleAuto(preambleLength, 8, MESHTASTIC_RADIOLIB_IRQ_RX_FLAGS);
-#endif
     };
 
     int16_t err = trySetStandby();

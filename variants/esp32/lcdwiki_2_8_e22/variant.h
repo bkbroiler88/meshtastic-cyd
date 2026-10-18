@@ -283,6 +283,12 @@
 #define SX126X_TXEN RADIOLIB_NC
 #define SX126X_RXEN 4
 #define SX126X_DIO3_TCXO_VOLTAGE 1.8
+// On-device LoRa Actions > Radio Tuning: TCXO start-up, AGC reset policy and RX mode, stored in
+// NVS (src/mesh/RadioTuning.*). Added while chasing critical fault 7 after long idle on 2.8.1.
+#define RADIO_TUNING_MENU
+// Default 5 ms, RadioLib's own value and what 2.8.0 ran with. Upstream's 1 ms (#12018) is tuned on
+// other boards; the E22's DIO3 TCXO may need longer when the chip wakes from duty-cycle sleep.
+#define TCXO_STARTUP_DELAY_US 5000
 
 // TX power is NOT set here. The E22-900M30S has a 10 dB external PA and a 30 dBm
 // rated output, so platformio.ini defines EBYTE_E22_900M30S and configuration.h:138

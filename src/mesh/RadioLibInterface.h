@@ -2,6 +2,7 @@
 
 #include "MeshPacketQueue.h"
 #include "RadioInterface.h"
+#include "RadioTuning.h"
 #include "concurrency/NotifiedWorkerThread.h"
 
 #include <RadioLib.h>
@@ -226,6 +227,11 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
 
     /** Chip-specific recovery of a chip that lost its state to a reset/brownout. Returns true if reprogrammed. */
     virtual bool recoverChipStateLoss() { return false; }
+
+#ifdef RADIO_TUNING_MENU
+    /** Read back chip status/errors into radiotune's diagnostics. `where` must be a string literal. */
+    virtual void captureChipDiag(const char *where, radiotune::SnapKind kind = radiotune::SnapKind::Fault) {}
+#endif
 
     /** Throttled recoverChipStateLoss(), so a dead chip can't stall the RX/TX hot paths with repeated begin(). */
     bool maybeRecoverChipStateLoss();

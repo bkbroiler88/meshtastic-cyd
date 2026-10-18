@@ -2,6 +2,7 @@
 #include "MeshTypes.h"
 #include "NodeDB.h"
 #include "PowerMon.h"
+#include "RadioTuning.h"
 #include "RadioTxHook.h"
 #include "SPILock.h"
 #include "Throttle.h"
@@ -66,7 +67,11 @@ uint32_t RadioLibInterface::tcxoStartupDelayUs()
         LOG_WARN("Ignore Lora.DIO3_TCXO_DELAY_US %d, use %u us", portduino_config.dio3_tcxo_delay_us,
                  (unsigned)TCXO_STARTUP_DELAY_US);
 #endif
+#ifdef RADIO_TUNING_MENU
+    return radiotune::tcxoDelayUs(); // LoRa Actions > Radio Tuning > TCXO Start-up
+#else
     return TCXO_STARTUP_DELAY_US;
+#endif
 }
 
 #ifdef ARCH_ESP32
@@ -584,8 +589,12 @@ void RadioLibInterface::handleTransmitInterrupt()
 {
     // This can be null if we forced the device to enter standby mode.  In that case
     // ignore the transmit interrupt
-    if (sendingPacket)
+    if (sendingPacket) {
+#ifdef RADIO_TUNING_MENU
+        captureChipDiag("tx-done", radiotune::SnapKind::TxDone); // PA_RAMP_ERR latches here if the chip's PA failed to ramp
+#endif
         completeSending();
+    }
     powerMon->clearState(meshtastic_PowerMon_State_Lora_TXOn); // But our transmitter is definitely off now
 }
 
@@ -767,7 +776,22 @@ void RadioLibInterface::periodicRadioMaintenance()
 
     // A radio that is still decoding packets has gain that isn't stuck
     const bool hearing = lastRxGoodMs && Throttle::isWithinTimespanMs(lastRxGoodMs, AGC_IDLE_RESET_MS);
-    if (hearing && lastAgcResetMs && Throttle::isWithinTimespanMs(lastAgcResetMs, AGC_FORCED_RESET_MS))
+    const bool forcedDue = !lastAgcResetMs || !Throttle::isWithinTimespanMs(lastAgcResetMs, AGC_FORCED_RESET_MS);
+    bool skip = hearing && !forcedDue;
+#ifdef RADIO_TUNING_MENU
+    // LoRa Actions > Radio Tuning > AGC Reset
+    switch (radiotune::agcMode()) {
+    case radiotune::AgcMode::EveryMinute:
+        skip = false; // every maintenance tick, as 2.8.1 did
+        break;
+    case radiotune::AgcMode::DailyOnly:
+        skip = !forcedDue;
+        break;
+    case radiotune::AgcMode::WhenIdle:
+        break;
+    }
+#endif
+    if (skip)
         return;
     if (resetAGC()) {
         const uint32_t now = millis();
@@ -798,8 +822,14 @@ bool RadioLibInterface::maybeRecoverChipStateLoss()
     lastChipRecoveryMs = Time::skipZero(Time::getMillis());
     RECORD_CRITICALERROR(meshtastic_CriticalErrorCode_INVALID_RADIO_SETTING);
     LOG_ERROR("Radio chip state lost mid-operation, re-init");
+#ifdef RADIO_TUNING_MENU
+    captureChipDiag("pre-reinit");
+#endif
     bool recovered = recoverChipStateLoss();
     LOG_INFO("Radio re-init %s", recovered ? "succeeded" : "failed");
+#ifdef RADIO_TUNING_MENU
+    captureChipDiag("post-reinit");
+#endif
     return recovered;
 }
 
