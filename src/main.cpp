@@ -365,6 +365,21 @@ void printInfo()
     LOG_INFO("S:B:%d,%s,%s,%s", HW_VENDOR, optstr(APP_VERSION), optstr(APP_ENV), optstr(APP_REPO));
 }
 #ifndef PIO_UNIT_TESTING
+#if defined(HAS_SDCARD)
+// The SD card shares the radio's SPI bus on some boards. Until RadioLib takes the radio's
+// chip-select, that pin floats, the radio answers the card's probe and the probe logs CRC
+// errors (and can fail). Hold the radio deselected first.
+static void deselectLoraForSd()
+{
+#if defined(LORA_CS) && !defined(ARCH_PORTDUINO)
+    if (LORA_CS >= 0) {
+        pinMode(LORA_CS, OUTPUT);
+        digitalWrite(LORA_CS, HIGH);
+    }
+#endif
+}
+#endif
+
 void setup()
 {
 
@@ -836,6 +851,7 @@ void setup()
 #endif
 
 #if defined(HAS_SDCARD) && !defined(SDCARD_EXCLUSIVE_WITH_BLE_WIFI)
+    deselectLoraForSd();
     setupSDCard();
 #endif
     // Boards that define SDCARD_EXCLUSIVE_WITH_BLE_WIFI mount the card later instead, once
@@ -897,6 +913,7 @@ void setup()
     // loaded once nodeDB exists, immediately above.
     if (!config.bluetooth.enabled && !config.network.wifi_enabled) {
         const uint32_t before8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+        deselectLoraForSd();
         setupSDCard();
         LOG_INFO("SD mounted (wifi=%d bt=%d): 8bit %u -> %u, largest8 now %u",
                  (int)config.network.wifi_enabled, (int)config.bluetooth.enabled, before8,

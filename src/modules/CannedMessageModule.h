@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #if HAS_SCREEN
 #include "ProtobufModule.h"
 #include "input/InputBroker.h"
@@ -57,6 +58,11 @@ class CannedMessageModule : public SinglePortModule, public Observable<const UIF
 
     void LaunchWithDestination(NodeNum, uint8_t newChannel = 0);
     void LaunchFreetextWithDestination(NodeNum, uint8_t newChannel = 0);
+#if HAS_COLOR_KEYBOARD
+    /// Open the colour keyboard on `initial` for a settings field instead of a message: Send hands
+    /// the text to `done`, close discards it. `header` must outlive the edit (a literal).
+    void LaunchTextEdit(const char *header, const char *initial, uint16_t maxChars, std::function<void(const String &)> done);
+#endif
 
     // === Emote Picker navigation ===
     int emotePickerIndex = 0; // Tracks currently selected emote in the picker
@@ -184,6 +190,11 @@ class CannedMessageModule : public SinglePortModule, public Observable<const UIF
 #if HAS_COLOR_KEYBOARD
     // Full-colour keyboard drawn straight to the panel; the mono one above is the fallback.
     graphics::TouchKeyboard colorKeyboard;
+    // Set while the keyboard edits a settings field (LaunchTextEdit) rather than a message
+    std::function<void(const String &)> editDone;
+    const char *editHeader = nullptr;
+    uint16_t editMaxChars = 0;
+    uint16_t keyboardMaxChars() const;
     bool handleColorKeyboardTouch(int16_t x, int16_t y);
 #endif
 

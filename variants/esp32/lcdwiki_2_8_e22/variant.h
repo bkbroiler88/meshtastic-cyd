@@ -288,6 +288,8 @@
 #define RADIO_TUNING_MENU
 // LoRa Actions > Spectrum: sweep analyzer + test transmitter on the E22 (pauses the mesh)
 #define SPECTRUM_ANALYZER
+// Home long-press > Quick Settings, System > Settings (names on the colour keyboard)
+#define LCDWIKI_EXTRAS
 // Default 5 ms, RadioLib's own value and what 2.8.0 ran with. Upstream's 1 ms (#12018) is tuned on
 // other boards; the E22's DIO3 TCXO may need longer when the chip wakes from duty-cycle sleep.
 #define TCXO_STARTUP_DELAY_US 5000

@@ -31,6 +31,10 @@ class AdminModule : public ProtobufModule<meshtastic_AdminMessage>, public Obser
      */
     AdminModule();
 
+    /// Owner change made on the device itself (Settings > names): same save and announce path
+    /// as a phone's set_owner.
+    void setOwnerLocally(const meshtastic_User &o) { handleSetOwner(o); }
+
   protected:
     /** Called to handle a particular incoming message
 

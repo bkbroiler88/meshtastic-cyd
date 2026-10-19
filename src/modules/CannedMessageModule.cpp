@@ -206,6 +206,29 @@ void CannedMessageModule::LaunchFreetextWithDestination(NodeNum newDest, uint8_t
     LOG_TRACE("[CannedMessage] LaunchFreetextWithDestination dest=0x%08x ch=%d", dest, channel);
 }
 
+#if HAS_COLOR_KEYBOARD
+void CannedMessageModule::LaunchTextEdit(const char *header, const char *initial, uint16_t maxChars,
+                                         std::function<void(const String &)> done)
+{
+    editHeader = header;
+    editMaxChars = maxChars;
+    editDone = std::move(done);
+    freetext = initial ? initial : "";
+    cursor = freetext.length();
+    updateState(CANNED_MESSAGE_RUN_STATE_FREETEXT, true);
+    UIFrameEvent e;
+    e.action = UIFrameEvent::Action::REGENERATE_FRAMESET;
+    notifyObservers(&e);
+}
+
+uint16_t CannedMessageModule::keyboardMaxChars() const
+{
+    if (editDone)
+        return editMaxChars;
+    return 200 - (moduleConfig.canned_message.send_bell ? 1 : 0);
+}
+#endif
+
 static bool returnToCannedList = false;
 bool hasKeyForNode(const meshtastic_NodeInfoLite *node)
 {
@@ -546,6 +569,7 @@ void CannedMessageModule::updateState(cannedMessageModuleRunState newState, bool
 #if HAS_COLOR_KEYBOARD
     if (runState == CANNED_MESSAGE_RUN_STATE_FREETEXT && newState != CANNED_MESSAGE_RUN_STATE_FREETEXT) {
         colorKeyboard.release();
+        editDone = nullptr; // a settings edit ends with the keyboard, whichever way it closed
     } else if (runState != CANNED_MESSAGE_RUN_STATE_FREETEXT && newState == CANNED_MESSAGE_RUN_STATE_FREETEXT) {
         colorKeyboard.shift = false;
         colorKeyboard.symbols = false;
@@ -844,7 +868,7 @@ bool CannedMessageModule::handleColorKeyboardTouch(int16_t x, int16_t y)
 {
     using Action = graphics::TouchKeyboard::Action;
     const auto hit = colorKeyboard.hitTest(x, y, this->freetext.c_str(), this->cursor);
-    const unsigned int maxChars = 200 - (moduleConfig.canned_message.send_bell ? 1 : 0);
+    const unsigned int maxChars = keyboardMaxChars();
     if (this->cursor > this->freetext.length())
         this->cursor = this->freetext.length();
 
@@ -892,6 +916,23 @@ bool CannedMessageModule::handleColorKeyboardTouch(int16_t x, int16_t y)
         this->cursor = min<unsigned int>(hit.cursor, this->freetext.length());
         break;
     case Action::Send:
+        if (editDone) {
+            // Settings edit: deliver the text and close, nothing is sent to the mesh
+            auto done = editDone;
+            const String text = freetext;
+            updateState(CANNED_MESSAGE_RUN_STATE_INACTIVE);
+            freetext = "";
+            cursor = 0;
+            payload = 0;
+            currentMessageIndex = -1;
+            UIFrameEvent e;
+            e.action = UIFrameEvent::Action::REGENERATE_FRAMESET;
+            notifyObservers(&e);
+            done(text);
+            if (screen)
+                screen->forceDisplay();
+            return true;
+        }
         updateState(CANNED_MESSAGE_RUN_STATE_ACTION_SELECT);
         payload = CANNED_MESSAGE_RUN_STATE_FREETEXT;
         currentMessageIndex = -1;
@@ -1625,11 +1666,13 @@ void CannedMessageModule::drawKeyboard(OLEDDisplay *display, OLEDDisplayUiState 
 #if HAS_COLOR_KEYBOARD
     {
         char header[64];
-        if (this->dest == NODENUM_BROADCAST)
+        if (editDone && editHeader)
+            snprintf(header, sizeof(header), "%s", editHeader);
+        else if (this->dest == NODENUM_BROADCAST)
             snprintf(header, sizeof(header), "To: #%s", channels.getName(this->channel));
         else
             snprintf(header, sizeof(header), "To: @%s", getNodeName(this->dest));
-        const uint16_t maxChars = 200 - (moduleConfig.canned_message.send_bell ? 1 : 0);
+        const uint16_t maxChars = keyboardMaxChars();
         const auto drawn = colorKeyboard.draw(this->freetext.c_str(), this->cursor, header, maxChars, display->getWidth(),
                                               display->getHeight());
         if (drawn != graphics::TouchKeyboard::DrawResult::Unavailable)

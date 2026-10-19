@@ -128,6 +128,9 @@
 // NOT config.display.displaymode INVERTED - that only styles the monochrome header
 // bitmap in SharedUIDisplay and does nothing once GRAPHICS_TFT_COLORING_ENABLED is on.
 #define LCDWIKI_PANEL_INVERT_TOGGLE 1
+// This board's ST7796U panel reads as a negative image with inversion off, so start inverted.
+// Display Options > Invert Colors still overrides it per board (saved in NVS).
+#define LCDWIKI_PANEL_INVERT_DEFAULT 1
 
 // TFTDisplay.cpp selects the LovyanGFX ST7796 block on ST7796_CS and reads the pins
 // through these names. Geometry comes from the TFT_* macros above. Do NOT define
@@ -300,6 +303,8 @@
 #define RADIO_TUNING_MENU
 // LoRa Actions > Spectrum: sweep analyzer + test transmitter on the E22 (pauses the mesh)
 #define SPECTRUM_ANALYZER
+// Home long-press > Quick Settings, System > Settings (names on the colour keyboard)
+#define LCDWIKI_EXTRAS
 // Default 5 ms, RadioLib's own value and what 2.8.0 ran with. Upstream's 1 ms (#12018) is tuned on
 // other boards; the E22's DIO3 TCXO may need longer when the chip wakes from duty-cycle sleep.
 #define TCXO_STARTUP_DELAY_US 5000

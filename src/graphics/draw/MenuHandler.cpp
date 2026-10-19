@@ -401,6 +401,135 @@ void menuHandler::spectrumConfirmMenu()
 }
 #endif
 
+#ifdef LCDWIKI_EXTRAS
+// Home long-press > Quick Settings: the handful of settings changed most often, each showing its
+// current value and opening a picker that returns here.
+void menuHandler::quickSettingsMenu()
+{
+    static char txLine[28];
+    static char hopLine[24];
+    static char btLine[24];
+    if (config.lora.tx_power == 0)
+        snprintf(txLine, sizeof(txLine), "TX Power: Max");
+    else
+        snprintf(txLine, sizeof(txLine), "TX Power: %d dBm", (int)config.lora.tx_power);
+    snprintf(hopLine, sizeof(hopLine), "Hop Limit: %u", (unsigned)(config.lora.hop_limit ? config.lora.hop_limit : 3));
+    snprintf(btLine, sizeof(btLine), "Bluetooth: %s", config.bluetooth.enabled ? "On" : "Off");
+
+    static const char *optionsArray[] = {"Back", "Brightness", txLine, hopLine, btLine};
+    enum optionsNumbers { Back = 0, Brightness, TxPower, HopLimit, Bluetooth };
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "Quick Settings";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 5;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected == Brightness)
+            menuHandler::menuQueue = menuHandler::BrightnessPicker;
+        else if (selected == TxPower)
+            menuHandler::menuQueue = menuHandler::TxPowerPicker;
+        else if (selected == HopLimit)
+            menuHandler::menuQueue = menuHandler::HopLimitPicker;
+        else if (selected == Bluetooth)
+            menuHandler::menuQueue = menuHandler::BluetoothToggleMenu;
+        else
+            return;
+        screen->runNow();
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+
+// Antenna power. 0 is the firmware default: the most the region and the board's PA allow.
+void menuHandler::txPowerPicker()
+{
+    static const char *optionsArray[] = {"Back", "Max (default)", "27 dBm", "24 dBm", "20 dBm", "17 dBm", "14 dBm", "10 dBm"};
+    static const int8_t levels[] = {0, 0, 27, 24, 20, 17, 14, 10};
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "TX Power";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 8;
+    bannerOptions.InitialSelected = 1;
+    for (int i = 2; i < 8; i++)
+        if (levels[i] == config.lora.tx_power)
+            bannerOptions.InitialSelected = i;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected >= 1 && selected < 8 && config.lora.tx_power != levels[selected]) {
+            config.lora.tx_power = levels[selected];
+            service->reloadConfig(SEGMENT_CONFIG);
+        }
+        menuHandler::menuQueue = menuHandler::QuickSettingsMenu;
+        screen->runNow();
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+
+void menuHandler::hopLimitPicker()
+{
+    static const char *optionsArray[] = {"Back", "1", "2", "3 (default)", "4", "5", "6", "7"};
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "Hop Limit";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 8;
+    const uint32_t current = config.lora.hop_limit ? config.lora.hop_limit : 3;
+    bannerOptions.InitialSelected = (current >= 1 && current <= 7) ? (int)current : 3;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected >= 1 && selected <= 7 && config.lora.hop_limit != (uint32_t)selected) {
+            config.lora.hop_limit = selected;
+            service->reloadConfig(SEGMENT_CONFIG);
+        }
+        menuHandler::menuQueue = menuHandler::QuickSettingsMenu;
+        screen->runNow();
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+
+#if HAS_COLOR_KEYBOARD && !MESHTASTIC_EXCLUDE_CANNEDMESSAGES
+// Name edits go through AdminModule like a phone's set_owner, so the change is saved and
+// announced the same way. Copying owner keeps every other field as it is.
+static void saveOwnerName(const String &text, bool shortName)
+{
+    String name = text;
+    name.trim();
+    if (!name.length() || !adminModule)
+        return;
+    meshtastic_User u = owner;
+    if (shortName) {
+        strncpy(u.short_name, name.c_str(), sizeof(u.short_name) - 1);
+        u.short_name[sizeof(u.short_name) - 1] = '\0';
+    } else {
+        strncpy(u.long_name, name.c_str(), sizeof(u.long_name) - 1);
+        u.long_name[sizeof(u.long_name) - 1] = '\0';
+    }
+    adminModule->setOwnerLocally(u);
+    screen->showSimpleBanner(shortName ? "Short name saved" : "Name saved", 2000);
+}
+#endif
+
+// System > Settings: on-device settings that otherwise need the app or the CLI.
+void menuHandler::settingsMenu()
+{
+    static const char *optionsArray[] = {"Back", "Long Name", "Short Name"};
+    enum optionsNumbers { Back = 0, LongName, ShortName };
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "Settings";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 3;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+#if HAS_COLOR_KEYBOARD && !MESHTASTIC_EXCLUDE_CANNEDMESSAGES
+        if (!cannedMessageModule)
+            return;
+        if (selected == LongName) {
+            cannedMessageModule->LaunchTextEdit("Long name", owner.long_name, sizeof(owner.long_name) - 1,
+                                                [](const String &t) { saveOwnerName(t, false); });
+        } else if (selected == ShortName) {
+            cannedMessageModule->LaunchTextEdit("Short name (4)", owner.short_name, sizeof(owner.short_name) - 1,
+                                                [](const String &t) { saveOwnerName(t, true); });
+        }
+#endif
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+#endif
+
 void menuHandler::OnboardMessage()
 {
     static const char *optionsArray[] = {"OK", "Got it!"};
@@ -1395,11 +1524,15 @@ void menuHandler::messageViewModeMenu()
 
 void menuHandler::homeBaseMenu()
 {
-    enum optionsNumbers { Back, Mute, Backlight, Position, Preset, Freetext, Sleep, enumEnd };
+    enum optionsNumbers { Back, Mute, Backlight, Position, Preset, Freetext, Sleep, QuickSettings, enumEnd };
 
     static const char *optionsArray[enumEnd] = {"Back"};
     static int optionsEnumArray[enumEnd] = {Back};
     int options = 1;
+#ifdef LCDWIKI_EXTRAS
+    optionsArray[options] = "Quick Settings";
+    optionsEnumArray[options++] = QuickSettings;
+#endif
 
     if (moduleConfig.external_notification.enabled && externalNotificationModule &&
         config.device.buzzer_mode != meshtastic_Config_DeviceConfig_BuzzerMode_DISABLED) {
@@ -1433,6 +1566,13 @@ void menuHandler::homeBaseMenu()
     bannerOptions.optionsEnumPtr = optionsEnumArray;
     bannerOptions.optionsCount = options;
     bannerOptions.bannerCallback = [](int selected) -> void {
+#ifdef LCDWIKI_EXTRAS
+        if (selected == QuickSettings) {
+            menuHandler::menuQueue = menuHandler::QuickSettingsMenu;
+            screen->runNow();
+            return;
+        }
+#endif
         if (selected == Mute) {
             if (moduleConfig.external_notification.enabled && externalNotificationModule) {
                 externalNotificationModule->setMute(!externalNotificationModule->getMute());
@@ -1498,7 +1638,7 @@ void menuHandler::textMessageBaseMenu()
 
 void menuHandler::systemBaseMenu()
 {
-    enum optionsNumbers { Back, Notifications, ScreenOptions, Bluetooth, WiFiToggle, PowerMenu, Test, enumEnd };
+    enum optionsNumbers { Back, Notifications, ScreenOptions, Bluetooth, WiFiToggle, PowerMenu, Test, Settings, enumEnd };
     static const char *optionsArray[enumEnd] = {"Back"};
     static int optionsEnumArray[enumEnd] = {Back};
     int options = 1;
@@ -1508,6 +1648,10 @@ void menuHandler::systemBaseMenu()
 
     optionsArray[options] = "Display Options";
     optionsEnumArray[options++] = ScreenOptions;
+#ifdef LCDWIKI_EXTRAS
+    optionsArray[options] = "Settings";
+    optionsEnumArray[options++] = Settings;
+#endif
 
     if (currentResolution == ScreenResolution::UltraLow) {
         optionsArray[options] = "Bluetooth";
@@ -1547,6 +1691,11 @@ void menuHandler::systemBaseMenu()
         } else if (selected == ScreenOptions) {
             menuHandler::menuQueue = menuHandler::ScreenOptionsMenu;
             screen->runNow();
+#ifdef LCDWIKI_EXTRAS
+        } else if (selected == Settings) {
+            menuHandler::menuQueue = menuHandler::SettingsMenu;
+            screen->runNow();
+#endif
         } else if (selected == PowerMenu) {
             menuHandler::menuQueue = menuHandler::PowerMenu;
             screen->runNow();
@@ -3439,6 +3588,20 @@ void menuHandler::handleMenuSwitch(OLEDDisplay *display)
 #ifdef SPECTRUM_ANALYZER
     case SpectrumConfirm:
         spectrumConfirmMenu();
+        break;
+#endif
+#ifdef LCDWIKI_EXTRAS
+    case QuickSettingsMenu:
+        quickSettingsMenu();
+        break;
+    case TxPowerPicker:
+        txPowerPicker();
+        break;
+    case HopLimitPicker:
+        hopLimitPicker();
+        break;
+    case SettingsMenu:
+        settingsMenu();
         break;
 #endif
     case FrequencySlot:

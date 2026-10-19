@@ -2337,7 +2337,12 @@ void TFTDisplay::setDisplayBrightness(uint8_t _brightness)
 // so which way round looks right is a per-board fact and has to be a user control.
 // Stored in NVS rather than uiconfig because DeviceUIConfig has no field for it and
 // adding one would mean regenerating protobufs.
-static bool tftInverted = false;
+// Out-of-the-box polarity until the user toggles it; a variant whose panel ships negative
+// sets LCDWIKI_PANEL_INVERT_DEFAULT 1 so a fresh flash is right without a trip to the menu.
+#ifndef LCDWIKI_PANEL_INVERT_DEFAULT
+#define LCDWIKI_PANEL_INVERT_DEFAULT 0
+#endif
+static bool tftInverted = LCDWIKI_PANEL_INVERT_DEFAULT;
 
 bool TFTDisplay::getDisplayInverted()
 {
@@ -2366,7 +2371,7 @@ static void tftRestoreInversion()
 #ifdef ARCH_ESP32
     Preferences prefs;
     if (prefs.begin("tftpanel", true)) {
-        tftInverted = prefs.getBool("invert", false);
+        tftInverted = prefs.getBool("invert", LCDWIKI_PANEL_INVERT_DEFAULT);
         prefs.end();
     }
 #endif

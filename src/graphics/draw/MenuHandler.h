@@ -76,6 +76,12 @@ class menuHandler
 #ifdef SPECTRUM_ANALYZER
         SpectrumConfirm,
 #endif
+#ifdef LCDWIKI_EXTRAS
+        QuickSettingsMenu,
+        TxPowerPicker,
+        HopLimitPicker,
+        SettingsMenu,
+#endif
 #if HAS_LORA_FEM
         LoraFemLnaToggleMenu
 #endif
@@ -99,6 +105,12 @@ class menuHandler
 #endif
 #ifdef SPECTRUM_ANALYZER
     static void spectrumConfirmMenu();
+#endif
+#ifdef LCDWIKI_EXTRAS
+    static void quickSettingsMenu();
+    static void txPowerPicker();
+    static void hopLimitPicker();
+    static void settingsMenu();
 #endif
     static void FrequencySlotPicker();
     static void handleMenuSwitch(OLEDDisplay *display);
