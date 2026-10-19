@@ -23,7 +23,6 @@ constexpr uint16_t BAR = 0x2C6A;     // dim green body
 constexpr uint16_t BAR_TOP = 0x3E8F; // bright green crest
 constexpr uint16_t PEAK = 0xE504;    // amber peak hold
 
-constexpr uint16_t AXIS_MHZ[] = {902, 909, 915, 922, 928};
 
 uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -59,6 +58,7 @@ SpectrumModule::SpectrumModule() : MeshModule("spectrum"), concurrency::OSThread
 {
     memset(cur, DBM_BOTTOM, sizeof(cur));
     memset(peak, DBM_BOTTOM, sizeof(peak));
+    memset(disp, DBM_BOTTOM, sizeof(disp));
     inputObserver.observe(inputBroker);
     disable();
 }
@@ -78,6 +78,7 @@ void SpectrumModule::start()
     LOG_INFO("Spectrum: radio taken from the mesh");
     memset(cur, DBM_BOTTOM, sizeof(cur));
     memset(peak, DBM_BOTTOM, sizeof(peak));
+    memset(disp, DBM_BOTTOM, sizeof(disp));
     sweepBin = 0;
     calibrationLeft = CALIBRATION_SWEEPS;
     calibrationSum = 0;
@@ -164,19 +165,25 @@ void SpectrumModule::runSweepChunk()
         sweepStartMs = millis();
 
     const uint32_t chunkStart = micros();
-    while (sweepBin < BINS && micros() - chunkStart < 20000) {
-        const int16_t v = r->spectrumSample(START_HZ + STEP_HZ / 2 + (uint32_t)sweepBin * STEP_HZ);
+    while (sweepBin < nBins && micros() - chunkStart < 20000) {
+        const int16_t v = r->spectrumSample(binHz(sweepBin));
         int8_t d = DBM_BOTTOM;
         if (v != INT16_MIN)
             d = (int8_t)(v < -128 ? -128 : (v > 0 ? 0 : v));
         else
             sweepFails++;
         cur[sweepBin] = d;
+        // Two-sweep running average for the drawn level; the first reading seeds it
+        disp[sweepBin] = (disp[sweepBin] == DBM_BOTTOM) ? d : (int8_t)((disp[sweepBin] + d) / 2);
         if (d > peak[sweepBin])
             peak[sweepBin] = d;
+        // Paint this bin now rather than the whole graph at the end of the sweep: the display
+        // refreshes continuously left to right instead of jumping a few times a second
+        if (!calibrationLeft && !needChrome)
+            drawColumn(sweepBin);
         sweepBin++;
     }
-    if (sweepBin < BINS)
+    if (sweepBin < nBins)
         return;
 
     sweepBin = 0;
@@ -186,7 +193,7 @@ void SpectrumModule::runSweepChunk()
     int32_t sum = 0;
     int8_t lo = 0, hi = -128;
     uint16_t hiBin = 0;
-    for (uint16_t i = 0; i < BINS; i++) {
+    for (uint16_t i = 0; i < nBins; i++) {
         sum += cur[i];
         if (cur[i] < lo)
             lo = cur[i];
@@ -196,10 +203,10 @@ void SpectrumModule::runSweepChunk()
         }
     }
     // Floor = mean of the bins at or below the overall mean, so a few strong signals do not lift it
-    const int16_t mean = (int16_t)(sum / BINS);
+    const int16_t mean = (int16_t)(sum / nBins);
     int32_t quietSum = 0;
     uint16_t quietN = 0;
-    for (uint16_t i = 0; i < BINS; i++) {
+    for (uint16_t i = 0; i < nBins; i++) {
         if (cur[i] <= mean) {
             quietSum += cur[i];
             quietN++;
@@ -208,11 +215,11 @@ void SpectrumModule::runSweepChunk()
     floorDbm = quietN ? (int16_t)(quietSum / quietN) : mean;
     if (millis() - lastStatsMs > 1000) {
         lastStatsMs = millis();
-        const uint32_t hiHz = START_HZ + STEP_HZ / 2 + (uint32_t)hiBin * STEP_HZ;
+        const uint32_t hiHz = binHz(hiBin);
         LOG_INFO("Spectrum: sweep %lums fails %u dBm min %d avg %d max %d @ %lu.%03lu MHz", (unsigned long)took, sweepFails, lo,
                  floorDbm, hi, (unsigned long)(hiHz / 1000000UL), (unsigned long)((hiHz / 1000UL) % 1000UL));
         if (lo == hi) // every bin identical: the readings are not real, log why
-            r->spectrumProbe(START_HZ + STEP_HZ / 2 + (uint32_t)cursorBin * STEP_HZ);
+            r->spectrumProbe(binHz(cursorBin));
     }
     sweepFails = 0;
 
@@ -230,16 +237,14 @@ void SpectrumModule::runSweepChunk()
     if (lo != hi) // a flat sweep is a dead reading, not a floor: do not rescale (and redraw) on it
         rescaleToFloor(false);
 
-    if (view == View::Spectrum)
-        drawSpectrum();
-    else
-        drawWaterfallRow();
+    if (view == View::Waterfall && !needChrome)
+        finishWaterfallRow();
 
     char left[32], right[32];
     snprintf(left, sizeof(left), W >= 400 ? "Spectrum  %u.%u/s" : "%u.%u/s", sweepMsTenths / 10, sweepMsTenths % 10);
-    const uint32_t hz = START_HZ + STEP_HZ / 2 + (uint32_t)cursorBin * STEP_HZ;
+    const uint32_t hz = binHz(cursorBin);
     snprintf(right, sizeof(right), "%lu.%03lu MHz  %d dBm", (unsigned long)(hz / 1000000UL),
-             (unsigned long)((hz / 1000UL) % 1000UL), cur[cursorBin]);
+             (unsigned long)((hz / 1000UL) % 1000UL), smooth ? disp[cursorBin] : cur[cursorBin]);
     drawHeader(left, right);
 }
 
@@ -315,9 +320,9 @@ int SpectrumModule::handleInputEvent(const InputEvent *event)
     if (ev == INPUT_BROKER_USER_PRESS && mode == Mode::Sweep && (event->touchX || event->touchY)) {
         const int16_t x = event->touchX;
         if (x >= plotX0 && x < plotX1) {
-            cursorBin = (uint16_t)((int32_t)(x - plotX0) * BINS / (plotX1 - plotX0));
-            if (cursorBin >= BINS)
-                cursorBin = BINS - 1;
+            cursorBin = (uint16_t)((int32_t)(x - plotX0) * nBins / (plotX1 - plotX0));
+            if (cursorBin >= nBins)
+                cursorBin = nBins - 1;
         }
     }
     return 1; // every other gesture is swallowed so nothing changes under the analyzer
@@ -326,20 +331,31 @@ int SpectrumModule::handleInputEvent(const InputEvent *event)
 void SpectrumModule::openOptions()
 {
     static char viewLine[24];
+    static char spanLine[24];
+    static char smoothLine[24];
     static char peakLine[24];
     snprintf(viewLine, sizeof(viewLine), "View: %s", view == View::Spectrum ? "Spectrum" : "Waterfall");
+    snprintf(spanLine, sizeof(spanLine), "Span: %s", nBins == BINS ? "Full Band" : "Zoom 4 MHz");
+    snprintf(smoothLine, sizeof(smoothLine), "Smoothing: %s", smooth ? "On" : "Off");
     snprintf(peakLine, sizeof(peakLine), "Peak Hold: %s", peakHold ? "On" : "Off");
-    static const char *options[] = {"Back", viewLine, peakLine, "Clear Peaks", "Test Transmit", "Exit to Mesh"};
-    enum { Back, ViewToggle, PeakToggle, ClearPeaks, TestTx, Exit };
+    static const char *options[] = {"Back",   viewLine,      spanLine,        smoothLine,
+                                    peakLine, "Clear Peaks", "Test Transmit", "Exit to Mesh"};
+    enum { Back, ViewToggle, SpanToggle, SmoothToggle, PeakToggle, ClearPeaks, TestTx, Exit };
 
     graphics::BannerOverlayOptions b;
     b.message = "Spectrum";
     b.optionsArrayPtr = options;
-    b.optionsCount = 6;
+    b.optionsCount = 8;
     b.bannerCallback = [this](int selected) {
         switch (selected) {
         case ViewToggle:
             view = (view == View::Spectrum) ? View::Waterfall : View::Spectrum;
+            break;
+        case SpanToggle:
+            setSpan(nBins == BINS); // zoom in around the cursor, or back out to the full band
+            break;
+        case SmoothToggle:
+            smooth = !smooth;
             break;
         case PeakToggle:
             peakHold = !peakHold;
@@ -401,7 +417,7 @@ void SpectrumModule::layout()
 
 int16_t SpectrumModule::binX(uint16_t bin) const
 {
-    return plotX0 + (int16_t)((int32_t)(plotX1 - plotX0) * bin / BINS);
+    return plotX0 + (int16_t)((int32_t)(plotX1 - plotX0) * bin / nBins);
 }
 
 int16_t SpectrumModule::dbmY(int16_t dbm, int16_t top, int16_t bottom) const
@@ -456,10 +472,16 @@ void SpectrumModule::drawChrome()
     }
     drawHeader("Spectrum", "");
 
-    char buf[8];
-    for (uint16_t mhz : AXIS_MHZ) {
-        const int16_t x = plotX0 + (int16_t)((int32_t)(plotX1 - plotX0) * (mhz - 902) / 26);
-        snprintf(buf, sizeof(buf), "%u", mhz);
+    // Five evenly spaced frequency labels across whatever span is showing
+    char buf[12];
+    const uint32_t spanKhz = (uint32_t)nBins * (STEP_HZ / 1000);
+    for (uint8_t k = 0; k <= 4; k++) {
+        const uint32_t khz = spanStartHz / 1000 + spanKhz * k / 4;
+        const int16_t x = plotX0 + (int16_t)((int32_t)(plotX1 - plotX0) * k / 4);
+        if (khz % 1000 == 0)
+            snprintf(buf, sizeof(buf), "%lu", (unsigned long)(khz / 1000));
+        else
+            snprintf(buf, sizeof(buf), "%lu.%lu", (unsigned long)(khz / 1000), (unsigned long)((khz % 1000) / 100));
         const int16_t w = graphics::tftDirectTextWidthF(buf, TftFont::Small);
         int16_t lx = x - w / 2;
         if (lx + w > W)
@@ -477,33 +499,83 @@ void SpectrumModule::drawChrome()
     }
 }
 
-// One column per bin, painted top-down in a single pass: black above the level, green below.
-// Nothing is cleared first, so a redraw never shows an empty frame.
-void SpectrumModule::drawBars(int16_t top, int16_t bottom, bool grid)
+// One bin's column, painted top-down in a single pass: black above the level, green below.
+// Nothing is cleared first, so a redraw never shows an empty column.
+void SpectrumModule::drawColumn(uint16_t i)
 {
-    for (uint16_t i = 0; i < BINS; i++) {
-        const int16_t x = binX(i);
-        int16_t w = binX(i + 1) - x;
-        if (w < 1)
-            w = 1;
-        const int16_t y = dbmY(cur[i], top, bottom);
-        if (y > top)
-            graphics::tftDirectFillRect(x, top, w, y - top, C_BLACK);
-        if (grid) {
-            for (int16_t d = viewTop - 10; d > viewBottom; d -= 20) {
-                const int16_t gy = dbmY(d, top, bottom);
-                if (gy < y)
-                    graphics::tftDirectFillRect(x, gy, w, 1, GRID);
-            }
+    const int16_t x = binX(i);
+    int16_t w = binX(i + 1) - x;
+    if (w < 1)
+        w = 1;
+    const int8_t level = smooth ? disp[i] : cur[i];
+    const bool grid = (view == View::Spectrum);
+    const int16_t top = plotY0;
+    const int16_t bottom = grid ? plotY1 : stripY1; // the waterfall keeps a small live strip on top
+    const int16_t y = dbmY(level, top, bottom);
+    if (y > top)
+        graphics::tftDirectFillRect(x, top, w, y - top, C_BLACK);
+    if (grid) {
+        for (int16_t d = viewTop - 10; d > viewBottom; d -= 20) {
+            const int16_t gy = dbmY(d, top, bottom);
+            if (gy < y)
+                graphics::tftDirectFillRect(x, gy, w, 1, GRID);
         }
-        const bool atCursor = (i == cursorBin);
-        if (bottom > y)
-            graphics::tftDirectFillRect(x, y, w, bottom - y, atCursor ? C_WHITE : BAR);
-        if (!atCursor)
-            graphics::tftDirectFillRect(x, y, w, 1, BAR_TOP);
-        if (grid && peakHold && peak[i] > cur[i])
-            graphics::tftDirectFillRect(x, dbmY(peak[i], top, bottom), w, 1, PEAK);
     }
+    const bool atCursor = (i == cursorBin);
+    if (bottom > y)
+        graphics::tftDirectFillRect(x, y, w, bottom - y, atCursor ? C_WHITE : BAR);
+    if (!atCursor)
+        graphics::tftDirectFillRect(x, y, w, 1, BAR_TOP);
+    if (grid && peakHold && peak[i] > level)
+        graphics::tftDirectFillRect(x, dbmY(peak[i], top, bottom), w, 1, PEAK);
+
+    if (!grid) {
+        // This sweep's waterfall row, coloured relative to the floor. Raw level: the waterfall
+        // is the history, and smoothing it would blur short bursts.
+        const int16_t rows = (plotY1 - wfY0) / 2;
+        if (rows <= 0)
+            return;
+        if (wfRow >= rows)
+            wfRow = 0;
+        graphics::tftDirectFillRect(x, wfY0 + wfRow * 2, w, 2, heat((int8_t)max(-128, min(0, cur[i] - floorDbm - 120))));
+    }
+}
+
+// The waterfall writes one 2 px row per sweep at a moving cursor and wraps, rather than
+// scrolling: no frame buffer, and only one row of the panel changes per sweep.
+void SpectrumModule::finishWaterfallRow()
+{
+    const int16_t rows = (plotY1 - wfY0) / 2;
+    if (rows <= 0)
+        return;
+    wfRow = (wfRow + 1) % rows;
+    graphics::tftDirectFillRect(plotX0, wfY0 + wfRow * 2, plotX1 - plotX0, 1, C_WHITE); // "now" marker
+}
+
+void SpectrumModule::setSpan(bool zoom)
+{
+    // Keep the cursor's frequency, and centre the zoom window on it where the band edge allows
+    const uint16_t fullIdx = (uint16_t)((binHz(cursorBin) - START_HZ) / STEP_HZ);
+    if (zoom) {
+        int32_t first = (int32_t)fullIdx - ZOOM_BINS / 2;
+        if (first < 0)
+            first = 0;
+        if (first > BINS - ZOOM_BINS)
+            first = BINS - ZOOM_BINS;
+        spanStartHz = START_HZ + (uint32_t)first * STEP_HZ;
+        nBins = ZOOM_BINS;
+        cursorBin = fullIdx - (uint16_t)first;
+    } else {
+        spanStartHz = START_HZ;
+        nBins = BINS;
+        cursorBin = fullIdx;
+    }
+    memset(cur, DBM_BOTTOM, sizeof(cur));
+    memset(disp, DBM_BOTTOM, sizeof(disp));
+    memset(peak, DBM_BOTTOM, sizeof(peak));
+    sweepBin = 0;
+    wfRow = 0;
+    needChrome = true;
 }
 
 // Floor sits ~10 dB above the bottom edge, on a 10 dB line. Rescaling relabels the axis (a full
@@ -536,34 +608,6 @@ void SpectrumModule::drawSplash()
     static const char *hint = "Keep nearby transmitters quiet";
     const int16_t hw = graphics::tftDirectTextWidthF(hint, TftFont::Small);
     graphics::tftDirectTextF((W - hw) / 2, cy + 8, hint, LABEL, C_BLACK, TftFont::Small);
-}
-
-void SpectrumModule::drawSpectrum()
-{
-    drawBars(plotY0, plotY1, true);
-}
-
-// The waterfall writes one 2 px row per sweep at a moving cursor and wraps, rather than
-// scrolling: no frame buffer, and only one row of the panel changes per sweep.
-void SpectrumModule::drawWaterfallRow()
-{
-    drawBars(plotY0, stripY1, false);
-
-    const int16_t rows = (plotY1 - wfY0) / 2;
-    if (rows <= 0)
-        return;
-    if (wfRow >= rows)
-        wfRow = 0;
-    const int16_t y = wfY0 + wfRow * 2;
-    for (uint16_t i = 0; i < BINS; i++) {
-        const int16_t x = binX(i);
-        int16_t w = binX(i + 1) - x;
-        if (w < 1)
-            w = 1;
-        graphics::tftDirectFillRect(x, y, w, 2, heat((int8_t)max(-128, min(0, cur[i] - floorDbm - 120))));
-    }
-    wfRow = (wfRow + 1) % rows;
-    graphics::tftDirectFillRect(plotX0, wfY0 + wfRow * 2, plotX1 - plotX0, 1, C_WHITE); // "now" marker
 }
 
 void SpectrumModule::drawTestTx()

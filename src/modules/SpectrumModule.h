@@ -60,9 +60,10 @@ class SpectrumModule : public MeshModule, private concurrency::OSThread
     void layout();
     void drawChrome();
     void drawHeader(const char *left, const char *right);
-    void drawBars(int16_t top, int16_t bottom, bool grid);
-    void drawSpectrum();
-    void drawWaterfallRow();
+    void drawColumn(uint16_t bin);  // one bin, the moment it is measured
+    void finishWaterfallRow(); // advance the waterfall row and its "now" marker
+    void setSpan(bool zoom);
+    uint32_t binHz(uint16_t bin) const { return spanStartHz + STEP_HZ / 2 + (uint32_t)bin * STEP_HZ; }
     void drawTestTx();
     int16_t binX(uint16_t bin) const;
     int16_t dbmY(int16_t dbm, int16_t top, int16_t bottom) const;
@@ -79,6 +80,13 @@ class SpectrumModule : public MeshModule, private concurrency::OSThread
 
     int8_t cur[BINS];
     int8_t peak[BINS];
+    int8_t disp[BINS]; // smoothed level actually drawn (running average of cur)
+    bool smooth = true;
+
+    // Span: the whole band, or a zoom window around the cursor (far fewer steps, so far faster)
+    static constexpr uint16_t ZOOM_BINS = 32; // +/-2 MHz at 125 kHz
+    uint32_t spanStartHz = START_HZ;
+    uint16_t nBins = BINS;
     uint16_t sweepBin = 0;
     uint32_t sweepStartMs = 0;
     uint16_t sweepMsTenths = 0; // tenths of a sweep per second, for the header
