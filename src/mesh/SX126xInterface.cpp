@@ -429,6 +429,119 @@ template <typename T> int16_t SX126xInterface<T>::trySetStandby()
     return err;
 }
 
+#ifdef SPECTRUM_ANALYZER
+#ifndef SPECTRUM_SETTLE_US
+#define SPECTRUM_SETTLE_US 1000 // PLL lock + RSSI averaging after SetRx, before GetRssiInst
+#endif
+
+template <typename T> bool SX126xInterface<T>::spectrumBegin()
+{
+    if (sendingPacket)
+        return false; // let the packet in flight finish first
+    disableInterrupt();
+    isReceiving = false;
+    activeReceiveStart = 0;
+    setTransmitEnable(false);
+    // XOSC standby keeps the TCXO running between steps, so a retune never waits on its start-up
+    if (lora.standby(RADIOLIB_SX126X_STANDBY_XOSC) != RADIOLIB_ERR_NONE)
+        return false;
+    if (lora.setBandwidth(125.0) != RADIOLIB_ERR_NONE) // RX bandwidth = sweep step
+        return false;
+    // RadioLib drives RXEN only from its own mode calls; the raw SetRx in spectrumSample() is not
+    // one, so select the receive path here or the sweep would measure through an idle switch
+    module.setRfSwitchState(Module::MODE_RX);
+    spectrumPaused = true;
+    return true;
+}
+
+template <typename T> int16_t SX126xInterface<T>::spectrumSample(uint32_t hz)
+{
+    // Raw commands: RadioLib's setFrequency/startReceive add range checks, IRQ and packet setup
+    // that a few hundred retunes per sweep do not need.
+    const uint32_t frf = (uint32_t)(((uint64_t)hz << 25) / 32000000ULL);
+    const uint8_t stby = RADIOLIB_SX126X_STANDBY_XOSC;
+    const uint8_t freq[4] = {(uint8_t)(frf >> 24), (uint8_t)(frf >> 16), (uint8_t)(frf >> 8), (uint8_t)frf};
+    const uint8_t rxInf[3] = {0xFF, 0xFF, 0xFF};
+    if (module.SPIwriteStream(RADIOLIB_SX126X_CMD_SET_STANDBY, &stby, 1) != RADIOLIB_ERR_NONE ||
+        module.SPIwriteStream(RADIOLIB_SX126X_CMD_SET_RF_FREQUENCY, freq, 4) != RADIOLIB_ERR_NONE)
+        return INT16_MIN;
+    // Same as RadioLib's launchMode(): receive path selected, then SetRx without status verify
+    module.setRfSwitchState(Module::MODE_RX);
+    if (module.SPIwriteStream(RADIOLIB_SX126X_CMD_SET_RX, rxInf, 3, true, false) != RADIOLIB_ERR_NONE)
+        return INT16_MIN;
+    delayMicroseconds(SPECTRUM_SETTLE_US);
+    uint8_t raw = 0;
+    if (module.SPIreadStream(RADIOLIB_SX126X_CMD_GET_RSSI_INST, &raw, 1) != RADIOLIB_ERR_NONE)
+        return INT16_MIN;
+    return -(int16_t)raw / 2;
+}
+
+template <typename T> void SX126xInterface<T>::spectrumProbe(uint32_t hz)
+{
+    // Once per sweep, for the log: chip mode right after a raw sample, then the same frequency
+    // measured through RadioLib's own receive path. If only the second reads a real level, the
+    // raw retune sequence is what is wrong.
+    const int16_t rawDbm = spectrumSample(hz);
+    uint8_t st[2] = {RADIOLIB_SX126X_CMD_GET_STATUS, RADIOLIB_SX126X_CMD_NOP};
+    uint8_t in[2] = {0, 0};
+    module.hal->spiBeginTransaction();
+    module.hal->digitalWrite(diagCs, module.hal->GpioLevelLow);
+    module.hal->spiTransfer(st, 2, in);
+    module.hal->digitalWrite(diagCs, module.hal->GpioLevelHigh);
+    module.hal->spiEndTransaction();
+
+    lora.standby(RADIOLIB_SX126X_STANDBY_XOSC);
+    float hl = -999;
+    if (lora.setFrequency(hz / 1e6f, true) == RADIOLIB_ERR_NONE &&
+        lora.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF, MESHTASTIC_RADIOLIB_IRQ_RX_FLAGS) == RADIOLIB_ERR_NONE) {
+        delay(5);
+        hl = lora.getRSSI(false);
+    }
+    LOG_INFO("Spectrum probe %lu Hz: raw %d dBm (status 0x%02x %s), RadioLib %d dBm, rxen=%d", (unsigned long)hz, rawDbm, in[1],
+             radiotune::chipModeName(in[1]), (int)hl, SX126X_RXEN != RADIOLIB_NC ? digitalRead(SX126X_RXEN) : -1);
+    lora.standby(RADIOLIB_SX126X_STANDBY_XOSC);
+    module.setRfSwitchState(Module::MODE_RX);
+}
+
+template <typename T> bool SX126xInterface<T>::spectrumTestTxStart(int8_t outDbm)
+{
+    // Antenna power -> chip power through the board's PA gain, the same table limitPower() uses
+    static const uint16_t gain[NUM_PA_POINTS] = {TX_GAIN_LORA};
+    int chip = outDbm - (int)gain[NUM_PA_POINTS - 1];
+    if (chip > SX126X_MAX_POWER)
+        chip = SX126X_MAX_POWER;
+    if (chip < -9)
+        chip = -9;
+
+    lora.standby(RADIOLIB_SX126X_STANDBY_XOSC);
+    // On the mesh channel, short (SF7) and on a private sync word: other nodes see energy, not packets
+    if (lora.setFrequency(getFreq()) != RADIOLIB_ERR_NONE || lora.setSpreadingFactor(7) != RADIOLIB_ERR_NONE ||
+        lora.setSyncWord(0x12) != RADIOLIB_ERR_NONE)
+        return false;
+#ifdef SX126X_NO_POWER_OPTIMIZATION_TABLE
+    int16_t err = lora.setOutputPower(chip, false);
+#else
+    int16_t err = lora.setOutputPower(chip);
+#endif
+    if (err != RADIOLIB_ERR_NONE)
+        return false;
+    setTransmitEnable(true);
+    static const uint8_t payload[16] = {'S', 'P', 'E', 'C', 'T', 'R', 'U', 'M', ' ', 'T', 'E', 'S', 'T'};
+    return lora.startTransmit(payload, sizeof(payload)) == RADIOLIB_ERR_NONE;
+}
+
+template <typename T> bool SX126xInterface<T>::spectrumTestTxDone()
+{
+    if (!(lora.getIrqFlags() & RADIOLIB_SX126X_IRQ_TX_DONE))
+        return false;
+    lora.finishTransmit();
+    setTransmitEnable(false);
+    lora.standby(RADIOLIB_SX126X_STANDBY_XOSC);
+    module.setRfSwitchState(Module::MODE_RX); // back to the receive path for the sweep
+    return true;
+}
+#endif
+
 #ifdef RADIO_TUNING_MENU
 template <typename T> void SX126xInterface<T>::captureChipDiag(const char *where, radiotune::SnapKind kind)
 {
@@ -528,6 +641,10 @@ template <typename T> void SX126xInterface<T>::startReceive()
     sleep();
 #else
 
+#ifdef SPECTRUM_ANALYZER
+    if (spectrumPaused)
+        return; // the analyzer owns the chip; spectrumEnd() re-arms RX through reconfigure()
+#endif
     setTransmitEnable(false);
 
 #ifdef ARCH_PORTDUINO_WASM

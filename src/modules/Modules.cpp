@@ -22,6 +22,7 @@
 #if HAS_SCREEN && BASEUI_HAS_GAMES
 #include "modules/games/GamesModule.h"
 #endif
+#include "modules/SpectrumModule.h"
 #if !MESHTASTIC_EXCLUDE_DETECTIONSENSOR
 #include "modules/DetectionSensorModule.h"
 #endif
@@ -220,6 +221,11 @@ void setupModules()
 #if HAS_SCREEN && BASEUI_HAS_GAMES
     if (config.display.displaymode != meshtastic_Config_DisplayConfig_DisplayMode_COLOR) {
         gamesModule = new GamesModule();
+    }
+#endif
+#if HAS_SCREEN && defined(SPECTRUM_ANALYZER) && defined(MESHTASTIC_MAP_DIRECT_COLOR)
+    if (config.display.displaymode != meshtastic_Config_DisplayConfig_DisplayMode_COLOR) {
+        spectrumModule = new SpectrumModule();
     }
 #endif
 #if ARCH_PORTDUINO

@@ -73,6 +73,9 @@ class menuHandler
         RxModePicker,
         RadioDiagMenu,
 #endif
+#ifdef SPECTRUM_ANALYZER
+        SpectrumConfirm,
+#endif
 #if HAS_LORA_FEM
         LoraFemLnaToggleMenu
 #endif
@@ -93,6 +96,9 @@ class menuHandler
     static void agcModePicker();
     static void rxModePicker();
     static void radioDiagMenu();
+#endif
+#ifdef SPECTRUM_ANALYZER
+    static void spectrumConfirmMenu();
 #endif
     static void FrequencySlotPicker();
     static void handleMenuSwitch(OLEDDisplay *display);

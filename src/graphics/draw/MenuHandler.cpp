@@ -27,6 +27,12 @@
 #include "mesh/MeshTypes.h"
 #include "mesh/RadioLibInterface.h"
 #include "mesh/RadioTuning.h"
+#include "modules/SpectrumModule.h"
+#if defined(SPECTRUM_ANALYZER) && defined(MESHTASTIC_MAP_DIRECT_COLOR)
+#define HAS_SPECTRUM_MENU 1
+#else
+#define HAS_SPECTRUM_MENU 0
+#endif
 #include "modules/AdminModule.h"
 #include "modules/CannedMessageModule.h"
 #if !MESHTASTIC_EXCLUDE_MQTT
@@ -173,6 +179,9 @@ void menuHandler::loraMenu()
 #ifdef RADIO_TUNING_MENU
         "Radio Tuning",
 #endif
+#if HAS_SPECTRUM_MENU
+        "Spectrum",
+#endif
 #if HAS_LORA_FEM
         "FEM LNA",
 #endif
@@ -188,6 +197,9 @@ void menuHandler::loraMenu()
         TxEnabled = 5,
 #ifdef RADIO_TUNING_MENU
         RadioTuning,
+#endif
+#if HAS_SPECTRUM_MENU
+        Spectrum,
 #endif
 #if HAS_LORA_FEM
         LoraFemLna,
@@ -219,6 +231,11 @@ void menuHandler::loraMenu()
 #ifdef RADIO_TUNING_MENU
         else if (selected == RadioTuning) {
             menuHandler::menuQueue = menuHandler::RadioTuningMenu;
+        }
+#endif
+#if HAS_SPECTRUM_MENU
+        else if (selected == Spectrum) {
+            menuHandler::menuQueue = menuHandler::SpectrumConfirm; // opened once this banner has closed
         }
 #endif
 #if HAS_LORA_FEM
@@ -366,6 +383,21 @@ void menuHandler::radioDiagMenu()
         screen->runNow();
     };
     screen->showOverlayBanner(bannerOptions);
+}
+#endif
+
+#ifdef SPECTRUM_ANALYZER
+// LoRa Actions > Spectrum. The analyzer needs the radio to itself, so the mesh stops until Exit to Mesh.
+void menuHandler::spectrumConfirmMenu()
+{
+#if HAS_SPECTRUM_MENU
+    showConfirmationBanner("Spectrum pauses the mesh.\nStart?", []() {
+        if (spectrumModule)
+            spectrumModule->start();
+        else
+            screen->showSimpleBanner("Spectrum unavailable", 2000);
+    });
+#endif
 }
 #endif
 
@@ -3402,6 +3434,11 @@ void menuHandler::handleMenuSwitch(OLEDDisplay *display)
         break;
     case RadioDiagMenu:
         radioDiagMenu();
+        break;
+#endif
+#ifdef SPECTRUM_ANALYZER
+    case SpectrumConfirm:
+        spectrumConfirmMenu();
         break;
 #endif
     case FrequencySlot:

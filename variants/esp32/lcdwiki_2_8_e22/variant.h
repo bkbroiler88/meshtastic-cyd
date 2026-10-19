@@ -286,6 +286,8 @@
 // On-device LoRa Actions > Radio Tuning: TCXO start-up, AGC reset policy and RX mode, stored in
 // NVS (src/mesh/RadioTuning.*). Added while chasing critical fault 7 after long idle on 2.8.1.
 #define RADIO_TUNING_MENU
+// LoRa Actions > Spectrum: sweep analyzer + test transmitter on the E22 (pauses the mesh)
+#define SPECTRUM_ANALYZER
 // Default 5 ms, RadioLib's own value and what 2.8.0 ran with. Upstream's 1 ms (#12018) is tuned on
 // other boards; the E22's DIO3 TCXO may need longer when the chip wakes from duty-cycle sleep.
 #define TCXO_STARTUP_DELAY_US 5000

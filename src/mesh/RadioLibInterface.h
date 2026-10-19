@@ -228,6 +228,23 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     /** Chip-specific recovery of a chip that lost its state to a reset/brownout. Returns true if reprogrammed. */
     virtual bool recoverChipStateLoss() { return false; }
 
+#ifdef SPECTRUM_ANALYZER
+    /// Set while the spectrum analyzer owns the radio: RX is off, the TX queue holds, maintenance skips.
+    bool spectrumPaused = false;
+    /// Take the radio from the mesh. False if a packet is mid-transmit or the chip refused.
+    virtual bool spectrumBegin() { return false; }
+    /// Instantaneous RSSI (dBm) at `hz`, or INT16_MIN on an SPI/BUSY failure.
+    virtual int16_t spectrumSample(uint32_t hz) { return INT16_MIN; }
+    /// Log one diagnostic comparison at `hz` (raw sample vs RadioLib's receive path).
+    virtual void spectrumProbe(uint32_t hz) {}
+    /// Start one short test packet (private sync word, so meshes ignore it) at `outDbm` antenna power.
+    virtual bool spectrumTestTxStart(int8_t outDbm) { return false; }
+    /// Poll for the test packet's TX_DONE; true once it has gone out.
+    virtual bool spectrumTestTxDone() { return true; }
+    /// Hand the radio back: full modem reprogram, RX re-armed, held packets released.
+    void spectrumEnd();
+#endif
+
 #ifdef RADIO_TUNING_MENU
     /** Read back chip status/errors into radiotune's diagnostics. `where` must be a string literal. */
     virtual void captureChipDiag(const char *where, radiotune::SnapKind kind = radiotune::SnapKind::Fault) {}

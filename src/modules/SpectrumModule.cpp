@@ -1,0 +1,582 @@
+#include "SpectrumModule.h"
+
+#if HAS_SCREEN && defined(SPECTRUM_ANALYZER) && defined(MESHTASTIC_MAP_DIRECT_COLOR)
+
+#include "PowerFSM.h"
+#include "graphics/Screen.h"
+#include "graphics/TFTDisplay.h"
+#include "main.h"
+#include "mesh/RadioLibInterface.h"
+
+using graphics::TftFont;
+
+SpectrumModule *spectrumModule;
+
+namespace
+{
+constexpr uint16_t C_BLACK = 0x0000;
+constexpr uint16_t C_WHITE = 0xFFFF;
+constexpr uint16_t HEADER_GREY = 0x4208; // BaseUI title bar
+constexpr uint16_t GRID = 0x2104;
+constexpr uint16_t LABEL = 0xAD55;
+constexpr uint16_t BAR = 0x2C6A;     // dim green body
+constexpr uint16_t BAR_TOP = 0x3E8F; // bright green crest
+constexpr uint16_t PEAK = 0xE504;    // amber peak hold
+
+constexpr uint16_t AXIS_MHZ[] = {902, 909, 915, 922, 928};
+
+uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
+{
+    return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
+// Waterfall palette: black -> navy -> cyan -> green -> yellow -> red over -125..-75 dBm. The caller
+// shifts readings so the sweep's mean sits at -120: background noise reads as dark blue speckle.
+uint16_t heat(int8_t dbm)
+{
+    static const uint8_t stops[][3] = {{0, 0, 0}, {0, 0, 140}, {0, 160, 200}, {0, 200, 60}, {240, 220, 0}, {230, 30, 20}};
+    constexpr int n = sizeof(stops) / sizeof(stops[0]);
+    int t = (dbm + 125) * 256 / 50; // 0..256
+    if (t < 0)
+        t = 0;
+    if (t > 256)
+        t = 256;
+    const int pos = t * (n - 1); // 0..256*(n-1)
+    const int k = pos >> 8;
+    const int u = pos & 0xFF;
+    const uint8_t *a = stops[k];
+    const uint8_t *b = stops[k + 1 < n ? k + 1 : k];
+    return rgb565(a[0] + ((b[0] - a[0]) * u >> 8), a[1] + ((b[1] - a[1]) * u >> 8), a[2] + ((b[2] - a[2]) * u >> 8));
+}
+
+RadioLibInterface *radio()
+{
+    return RadioLibInterface::instance;
+}
+} // namespace
+
+SpectrumModule::SpectrumModule() : MeshModule("spectrum"), concurrency::OSThread("Spectrum")
+{
+    memset(cur, DBM_BOTTOM, sizeof(cur));
+    memset(peak, DBM_BOTTOM, sizeof(peak));
+    inputObserver.observe(inputBroker);
+    disable();
+}
+
+// ---------------------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------------------
+
+void SpectrumModule::start()
+{
+    if (isActive() || !screen)
+        return;
+    if (!radio() || !radio()->spectrumBegin()) {
+        screen->showSimpleBanner("Radio busy, try again", 2000);
+        return;
+    }
+    LOG_INFO("Spectrum: radio taken from the mesh");
+    memset(cur, DBM_BOTTOM, sizeof(cur));
+    memset(peak, DBM_BOTTOM, sizeof(peak));
+    sweepBin = 0;
+    calibrationLeft = CALIBRATION_SWEEPS;
+    calibrationSum = 0;
+    mode = Mode::Sweep;
+    layout();
+    screen->setModalModule(this);
+    // Called from the confirm banner's callback: wait for that banner to close before drawing
+    bannerOpen = true;
+    needChrome = true;
+    lastHeader[0] = '\0';
+    lastAwakeKickMs = 0;
+    enabled = true;
+    setIntervalFromNow(20);
+}
+
+void SpectrumModule::stop()
+{
+    if (!isActive())
+        return;
+    mode = Mode::Off;
+    testInFlight = false;
+    if (radio())
+        radio()->spectrumEnd();
+    LOG_INFO("Spectrum: radio returned to the mesh");
+    graphics::tftReleaseDirectRows(); // the release itself queues a full repaint of the 1-bit UI
+    if (screen) {
+        screen->clearModalModule(this);
+        screen->forceDisplay(true);
+    }
+}
+
+int32_t SpectrumModule::runOnce()
+{
+    if (!isActive() || !screen)
+        return disable();
+
+    const uint32_t now = millis();
+    if (now - lastAwakeKickMs > 2000) { // keep the panel lit; there is no inactivity exit by design
+        powerFSM.trigger(EVENT_PRESS);
+        lastAwakeKickMs = now;
+    }
+
+    if (bannerOpen) {
+        if (screen->isOverlayBannerShowing())
+            return 50;
+        bannerOpen = false;
+        if (!isActive())
+            return disable(); // "Exit to Mesh" was picked
+        if (pendingTestMenu) {
+            pendingTestMenu = false;
+            openTestTxMenu();
+            return 50;
+        }
+        needChrome = true;
+    }
+
+    // End row is exclusive. While the whole panel is reserved, the 1-bit UI's full repaints skip it
+    // (TFTDisplay leaves reserved rows alone), so they are not a reason to redraw: doing so blanked
+    // the screen on every UI repaint. Chrome is redrawn only on our own state changes.
+    graphics::tftReserveDirectRows(0, H, 3000);
+    if (needChrome) {
+        drawChrome();
+        needChrome = false;
+    }
+
+    if (mode == Mode::TestTx) {
+        runTestTx();
+        return 5;
+    }
+    runSweepChunk();
+    return 2; // let the rest of the main loop (BLE, input, screen) breathe between chunks
+}
+
+// ---------------------------------------------------------------------------------------
+// Sweep and test transmit
+// ---------------------------------------------------------------------------------------
+
+void SpectrumModule::runSweepChunk()
+{
+    RadioLibInterface *r = radio();
+    if (!r)
+        return;
+    if (sweepBin == 0)
+        sweepStartMs = millis();
+
+    const uint32_t chunkStart = micros();
+    while (sweepBin < BINS && micros() - chunkStart < 20000) {
+        const int16_t v = r->spectrumSample(START_HZ + STEP_HZ / 2 + (uint32_t)sweepBin * STEP_HZ);
+        int8_t d = DBM_BOTTOM;
+        if (v != INT16_MIN)
+            d = (int8_t)(v < -128 ? -128 : (v > 0 ? 0 : v));
+        else
+            sweepFails++;
+        cur[sweepBin] = d;
+        if (d > peak[sweepBin])
+            peak[sweepBin] = d;
+        sweepBin++;
+    }
+    if (sweepBin < BINS)
+        return;
+
+    sweepBin = 0;
+    const uint32_t took = millis() - sweepStartMs;
+    sweepMsTenths = took ? (uint16_t)(10000UL / took) : 0;
+
+    int32_t sum = 0;
+    int8_t lo = 0, hi = -128;
+    uint16_t hiBin = 0;
+    for (uint16_t i = 0; i < BINS; i++) {
+        sum += cur[i];
+        if (cur[i] < lo)
+            lo = cur[i];
+        if (cur[i] > hi) {
+            hi = cur[i];
+            hiBin = i;
+        }
+    }
+    // Floor = mean of the bins at or below the overall mean, so a few strong signals do not lift it
+    const int16_t mean = (int16_t)(sum / BINS);
+    int32_t quietSum = 0;
+    uint16_t quietN = 0;
+    for (uint16_t i = 0; i < BINS; i++) {
+        if (cur[i] <= mean) {
+            quietSum += cur[i];
+            quietN++;
+        }
+    }
+    floorDbm = quietN ? (int16_t)(quietSum / quietN) : mean;
+    if (millis() - lastStatsMs > 1000) {
+        lastStatsMs = millis();
+        const uint32_t hiHz = START_HZ + STEP_HZ / 2 + (uint32_t)hiBin * STEP_HZ;
+        LOG_INFO("Spectrum: sweep %lums fails %u dBm min %d avg %d max %d @ %lu.%03lu MHz", (unsigned long)took, sweepFails, lo,
+                 floorDbm, hi, (unsigned long)(hiHz / 1000000UL), (unsigned long)((hiHz / 1000UL) % 1000UL));
+        if (lo == hi) // every bin identical: the readings are not real, log why
+            r->spectrumProbe(START_HZ + STEP_HZ / 2 + (uint32_t)cursorBin * STEP_HZ);
+    }
+    sweepFails = 0;
+
+    if (calibrationLeft) {
+        // Splash phase: average a few sweeps, then fix the scale and draw the real screen
+        calibrationSum += floorDbm;
+        if (--calibrationLeft == 0) {
+            floorDbm = (int16_t)(calibrationSum / CALIBRATION_SWEEPS);
+            memset(peak, DBM_BOTTOM, sizeof(peak));
+            LOG_INFO("Spectrum: noise floor %d dBm", floorDbm);
+            rescaleToFloor(true);
+        }
+        return;
+    }
+    if (lo != hi) // a flat sweep is a dead reading, not a floor: do not rescale (and redraw) on it
+        rescaleToFloor(false);
+
+    if (view == View::Spectrum)
+        drawSpectrum();
+    else
+        drawWaterfallRow();
+
+    char left[32], right[32];
+    snprintf(left, sizeof(left), W >= 400 ? "Spectrum  %u.%u/s" : "%u.%u/s", sweepMsTenths / 10, sweepMsTenths % 10);
+    const uint32_t hz = START_HZ + STEP_HZ / 2 + (uint32_t)cursorBin * STEP_HZ;
+    snprintf(right, sizeof(right), "%lu.%03lu MHz  %d dBm", (unsigned long)(hz / 1000000UL),
+             (unsigned long)((hz / 1000UL) % 1000UL), cur[cursorBin]);
+    drawHeader(left, right);
+}
+
+void SpectrumModule::beginTestTx(int8_t dbm)
+{
+    testDbm = dbm;
+    testSent = 0;
+    testInFlight = false;
+    testNextMs = millis();
+    mode = Mode::TestTx;
+    needChrome = true;
+    LOG_INFO("Spectrum: test transmit %u packets at %d dBm", TEST_PACKETS, dbm);
+}
+
+void SpectrumModule::runTestTx()
+{
+    RadioLibInterface *r = radio();
+    if (!r)
+        return;
+    const uint32_t now = millis();
+
+    if (testInFlight) {
+        if (r->spectrumTestTxDone()) {
+            testInFlight = false;
+            testSent++;
+            testNextMs = now + TEST_SPACING_MS;
+            drawTestTx();
+        } else if (now - testStartedMs > 3000) {
+            LOG_WARN("Spectrum: test packet %u never reported TX done", testSent + 1);
+            testInFlight = false;
+            testSent++;
+            testNextMs = now + TEST_SPACING_MS;
+        }
+        return;
+    }
+
+    if (testSent >= TEST_PACKETS) {
+        LOG_INFO("Spectrum: test transmit done");
+        mode = Mode::Sweep;
+        sweepBin = 0;
+        needChrome = true;
+        return;
+    }
+
+    if ((int32_t)(now - testNextMs) >= 0) {
+        if (r->spectrumTestTxStart(testDbm)) {
+            testInFlight = true;
+            testStartedMs = now;
+        } else {
+            LOG_WARN("Spectrum: test packet %u failed to start", testSent + 1);
+            testSent++;
+            testNextMs = now + TEST_SPACING_MS;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Input and banners
+// ---------------------------------------------------------------------------------------
+
+int SpectrumModule::handleInputEvent(const InputEvent *event)
+{
+    if (!isActive())
+        return 0;
+    if (bannerOpen || (screen && screen->isOverlayBannerShowing()))
+        return 0; // the banner owns input while it is up
+
+    const input_broker_event ev = event->inputEvent;
+    if (ev == INPUT_BROKER_SELECT || ev == INPUT_BROKER_SELECT_LONG) {
+        openOptions(); // touch long-press arrives as SELECT
+        return 1;
+    }
+    if (ev == INPUT_BROKER_USER_PRESS && mode == Mode::Sweep && (event->touchX || event->touchY)) {
+        const int16_t x = event->touchX;
+        if (x >= plotX0 && x < plotX1) {
+            cursorBin = (uint16_t)((int32_t)(x - plotX0) * BINS / (plotX1 - plotX0));
+            if (cursorBin >= BINS)
+                cursorBin = BINS - 1;
+        }
+    }
+    return 1; // every other gesture is swallowed so nothing changes under the analyzer
+}
+
+void SpectrumModule::openOptions()
+{
+    static char viewLine[24];
+    static char peakLine[24];
+    snprintf(viewLine, sizeof(viewLine), "View: %s", view == View::Spectrum ? "Spectrum" : "Waterfall");
+    snprintf(peakLine, sizeof(peakLine), "Peak Hold: %s", peakHold ? "On" : "Off");
+    static const char *options[] = {"Back", viewLine, peakLine, "Clear Peaks", "Test Transmit", "Exit to Mesh"};
+    enum { Back, ViewToggle, PeakToggle, ClearPeaks, TestTx, Exit };
+
+    graphics::BannerOverlayOptions b;
+    b.message = "Spectrum";
+    b.optionsArrayPtr = options;
+    b.optionsCount = 6;
+    b.bannerCallback = [this](int selected) {
+        switch (selected) {
+        case ViewToggle:
+            view = (view == View::Spectrum) ? View::Waterfall : View::Spectrum;
+            break;
+        case PeakToggle:
+            peakHold = !peakHold;
+            break;
+        case ClearPeaks:
+            memset(peak, DBM_BOTTOM, sizeof(peak));
+            break;
+        case TestTx:
+            pendingTestMenu = true; // opened from runOnce once this banner has closed
+            break;
+        case Exit:
+            stop();
+            break;
+        default:
+            break;
+        }
+    };
+    bannerOpen = true;
+    graphics::tftReleaseDirectRows();
+    screen->showOverlayBanner(b);
+}
+
+void SpectrumModule::openTestTxMenu()
+{
+    // Antenna power through the E22's PA. The other board watches this in its Spectrum view.
+    static const char *options[] = {"Back", "10 dBm", "20 dBm", "30 dBm (max)"};
+    static const int8_t levels[] = {0, 10, 20, 30};
+    graphics::BannerOverlayOptions b;
+    b.message = "Test Transmit";
+    b.optionsArrayPtr = options;
+    b.optionsCount = 4;
+    b.bannerCallback = [this](int selected) {
+        if (selected >= 1 && selected <= 3)
+            beginTestTx(levels[selected]);
+    };
+    bannerOpen = true;
+    graphics::tftReleaseDirectRows();
+    screen->showOverlayBanner(b);
+}
+
+// ---------------------------------------------------------------------------------------
+// Drawing
+// ---------------------------------------------------------------------------------------
+
+void SpectrumModule::layout()
+{
+    W = screen->getWidth();
+    H = screen->getHeight();
+    const int16_t th = graphics::tftDirectTextHeightF(TftFont::Small);
+    hdrH = th + 8;
+    plotX0 = graphics::tftDirectTextWidthF("-100", TftFont::Small) + 6;
+    plotX1 = W - 4;
+    plotY0 = hdrH + 4;
+    plotY1 = H - th - 6;
+    stripY1 = plotY0 + (plotY1 - plotY0) / 5;
+    wfY0 = stripY1 + 3;
+    wfRow = 0;
+}
+
+int16_t SpectrumModule::binX(uint16_t bin) const
+{
+    return plotX0 + (int16_t)((int32_t)(plotX1 - plotX0) * bin / BINS);
+}
+
+int16_t SpectrumModule::dbmY(int16_t dbm, int16_t top, int16_t bottom) const
+{
+    if (dbm > viewTop)
+        dbm = viewTop;
+    if (dbm < viewBottom)
+        dbm = viewBottom;
+    return top + (int16_t)((int32_t)(viewTop - dbm) * (bottom - top) / (viewTop - viewBottom));
+}
+
+void SpectrumModule::drawHeader(const char *left, const char *right)
+{
+    char key[sizeof(lastHeader)];
+    snprintf(key, sizeof(key), "%s|%s", left, right);
+    if (strcmp(key, lastHeader) == 0)
+        return; // unchanged: no repaint, no flicker
+    const bool fresh = lastHeader[0] == '\0'; // after drawChrome: the bar itself is not there yet
+    strncpy(lastHeader, key, sizeof(lastHeader) - 1);
+
+    // Text paints its own background, so it overwrites the old text in place; only the gap
+    // between the two labels is refilled. Clearing the whole bar first made the text blink.
+    const int16_t th = graphics::tftDirectTextHeightF(TftFont::Small);
+    const int16_t ty = (hdrH - th) / 2;
+    if (fresh)
+        graphics::tftDirectFillRect(0, 0, W, hdrH, HEADER_GREY);
+    const int16_t lw = graphics::tftDirectTextWidthF(left, TftFont::Small);
+    const int16_t rw = graphics::tftDirectTextWidthF(right, TftFont::Small);
+    const int16_t rx = W - 6 - rw;
+    graphics::tftDirectTextF(6, ty, left, C_WHITE, HEADER_GREY, TftFont::Small);
+    if (rx > 6 + lw)
+        graphics::tftDirectFillRect(6 + lw, ty, rx - (6 + lw), th, HEADER_GREY);
+    graphics::tftDirectTextF(rx, ty, right, C_WHITE, HEADER_GREY, TftFont::Small);
+}
+
+void SpectrumModule::drawChrome()
+{
+    graphics::tftDirectFillRect(0, 0, W, H, C_BLACK);
+    lastHeader[0] = '\0';
+    const int16_t th = graphics::tftDirectTextHeightF(TftFont::Small);
+
+    if (mode == Mode::TestTx) {
+        char right[16];
+        snprintf(right, sizeof(right), "%d dBm", testDbm);
+        drawHeader("Test Transmit", right);
+        drawTestTx();
+        return;
+    }
+    if (calibrationLeft) {
+        drawSplash();
+        return;
+    }
+    drawHeader("Spectrum", "");
+
+    char buf[8];
+    for (uint16_t mhz : AXIS_MHZ) {
+        const int16_t x = plotX0 + (int16_t)((int32_t)(plotX1 - plotX0) * (mhz - 902) / 26);
+        snprintf(buf, sizeof(buf), "%u", mhz);
+        const int16_t w = graphics::tftDirectTextWidthF(buf, TftFont::Small);
+        int16_t lx = x - w / 2;
+        if (lx + w > W)
+            lx = W - w;
+        graphics::tftDirectTextF(lx, plotY1 + 4, buf, LABEL, C_BLACK, TftFont::Small);
+    }
+    if (view == View::Spectrum) {
+        for (int16_t d = viewTop - 10; d > viewBottom; d -= 20) {
+            snprintf(buf, sizeof(buf), "%d", d);
+            const int16_t w = graphics::tftDirectTextWidthF(buf, TftFont::Small);
+            graphics::tftDirectTextF(plotX0 - 4 - w, dbmY(d, plotY0, plotY1) - th / 2, buf, LABEL, C_BLACK, TftFont::Small);
+        }
+    } else {
+        wfRow = 0;
+    }
+}
+
+// One column per bin, painted top-down in a single pass: black above the level, green below.
+// Nothing is cleared first, so a redraw never shows an empty frame.
+void SpectrumModule::drawBars(int16_t top, int16_t bottom, bool grid)
+{
+    for (uint16_t i = 0; i < BINS; i++) {
+        const int16_t x = binX(i);
+        int16_t w = binX(i + 1) - x;
+        if (w < 1)
+            w = 1;
+        const int16_t y = dbmY(cur[i], top, bottom);
+        if (y > top)
+            graphics::tftDirectFillRect(x, top, w, y - top, C_BLACK);
+        if (grid) {
+            for (int16_t d = viewTop - 10; d > viewBottom; d -= 20) {
+                const int16_t gy = dbmY(d, top, bottom);
+                if (gy < y)
+                    graphics::tftDirectFillRect(x, gy, w, 1, GRID);
+            }
+        }
+        const bool atCursor = (i == cursorBin);
+        if (bottom > y)
+            graphics::tftDirectFillRect(x, y, w, bottom - y, atCursor ? C_WHITE : BAR);
+        if (!atCursor)
+            graphics::tftDirectFillRect(x, y, w, 1, BAR_TOP);
+        if (grid && peakHold && peak[i] > cur[i])
+            graphics::tftDirectFillRect(x, dbmY(peak[i], top, bottom), w, 1, PEAK);
+    }
+}
+
+// Floor sits ~10 dB above the bottom edge, on a 10 dB line. Rescaling relabels the axis (a full
+// chrome redraw), so it only happens when the floor drifts out of a band around that point.
+void SpectrumModule::rescaleToFloor(bool force)
+{
+    if (!force && floorDbm >= viewBottom + 4 && floorDbm <= viewBottom + 18)
+        return;
+    const int16_t below = -(floorDbm - 10);
+    int16_t bottom = (int16_t)(-((below + 9) / 10) * 10);
+    if (bottom < -140)
+        bottom = -140;
+    if (bottom > -60)
+        bottom = -60;
+    if (!force && bottom == viewBottom)
+        return;
+    viewBottom = (int8_t)bottom;
+    viewTop = (int8_t)(bottom + VIEW_SPAN);
+    needChrome = true;
+}
+
+void SpectrumModule::drawSplash()
+{
+    drawHeader("Spectrum", "902-928 MHz");
+    static const char *title = "Setting noise floor";
+    const int16_t lh = graphics::tftDirectTextHeightF(TftFont::Large);
+    const int16_t tw = graphics::tftDirectTextWidthF(title, TftFont::Large);
+    const int16_t cy = (hdrH + H) / 2;
+    graphics::tftDirectTextF((W - tw) / 2, cy - lh, title, C_WHITE, C_BLACK, TftFont::Large);
+    static const char *hint = "Keep nearby transmitters quiet";
+    const int16_t hw = graphics::tftDirectTextWidthF(hint, TftFont::Small);
+    graphics::tftDirectTextF((W - hw) / 2, cy + 8, hint, LABEL, C_BLACK, TftFont::Small);
+}
+
+void SpectrumModule::drawSpectrum()
+{
+    drawBars(plotY0, plotY1, true);
+}
+
+// The waterfall writes one 2 px row per sweep at a moving cursor and wraps, rather than
+// scrolling: no frame buffer, and only one row of the panel changes per sweep.
+void SpectrumModule::drawWaterfallRow()
+{
+    drawBars(plotY0, stripY1, false);
+
+    const int16_t rows = (plotY1 - wfY0) / 2;
+    if (rows <= 0)
+        return;
+    if (wfRow >= rows)
+        wfRow = 0;
+    const int16_t y = wfY0 + wfRow * 2;
+    for (uint16_t i = 0; i < BINS; i++) {
+        const int16_t x = binX(i);
+        int16_t w = binX(i + 1) - x;
+        if (w < 1)
+            w = 1;
+        graphics::tftDirectFillRect(x, y, w, 2, heat((int8_t)max(-128, min(0, cur[i] - floorDbm - 120))));
+    }
+    wfRow = (wfRow + 1) % rows;
+    graphics::tftDirectFillRect(plotX0, wfY0 + wfRow * 2, plotX1 - plotX0, 1, C_WHITE); // "now" marker
+}
+
+void SpectrumModule::drawTestTx()
+{
+    char line[24];
+    snprintf(line, sizeof(line), "  Sent %u / %u  ", testSent, TEST_PACKETS);
+    const int16_t lh = graphics::tftDirectTextHeightF(TftFont::Large);
+    const int16_t lw = graphics::tftDirectTextWidthF(line, TftFont::Large);
+    const int16_t cy = (hdrH + H) / 2;
+    graphics::tftDirectTextF((W - lw) / 2, cy - lh, line, C_WHITE, C_BLACK, TftFont::Large);
+    static const char *hint = "Watch the other board's Spectrum view";
+    const int16_t hw = graphics::tftDirectTextWidthF(hint, TftFont::Small);
+    graphics::tftDirectTextF((W - hw) / 2, cy + 8, hint, LABEL, C_BLACK, TftFont::Small);
+}
+
+#endif

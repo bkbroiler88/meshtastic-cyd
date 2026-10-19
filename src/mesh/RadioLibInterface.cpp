@@ -421,6 +421,12 @@ void RadioLibInterface::deliverPendingIrqFromPoll(PendingISR cause)
 
 void RadioLibInterface::onNotify(uint32_t notification)
 {
+#ifdef SPECTRUM_ANALYZER
+    // The analyzer owns the chip: drop radio events and let queued packets wait. spectrumEnd()
+    // re-arms the transmit delay, so nothing is lost by ignoring TRANSMIT_DELAY_COMPLETED here.
+    if (spectrumPaused)
+        return;
+#endif
 
     switch (notification) {
     case ISR_TX:
@@ -762,8 +768,23 @@ bool RadioLibInterface::resetAGC()
     return false;
 }
 
+#ifdef SPECTRUM_ANALYZER
+void RadioLibInterface::spectrumEnd()
+{
+    if (!spectrumPaused)
+        return;
+    spectrumPaused = false;
+    reconfigure();      // SF/BW/sync word/frequency/power back to the mesh config, RX re-armed
+    setTransmitDelay(); // release whatever queued up while the analyzer had the radio
+}
+#endif
+
 void RadioLibInterface::periodicRadioMaintenance()
 {
+#ifdef SPECTRUM_ANALYZER
+    if (spectrumPaused)
+        return;
+#endif
     // Every startReceive() call site is event-driven (RX/TX ISR, the CAD-busy branch, reconfigure), and a
     // radio left with RX off can no longer raise an RX interrupt - on a node with nothing to transmit
     // nothing would ever re-arm it. This periodic tick is that retry; maybeRecoverChipStateLoss() throttles.

@@ -103,6 +103,17 @@ template <class T> class SX126xInterface : public RadioLibInterface
     /** Recover a chip that lost its runtime state: hardware-reset via begin() and reprogram */
     bool recoverChipStateLoss() override { return reinitChip() && programModemParams() == RADIOLIB_ERR_NONE; }
 
+#ifdef SPECTRUM_ANALYZER
+  public:
+    bool spectrumBegin() override;
+    int16_t spectrumSample(uint32_t hz) override;
+    void spectrumProbe(uint32_t hz) override;
+    bool spectrumTestTxStart(int8_t outDbm) override;
+    bool spectrumTestTxDone() override;
+
+  private:
+#endif
+
 #ifdef RADIO_TUNING_MENU
     void captureChipDiag(const char *where, radiotune::SnapKind kind = radiotune::SnapKind::Fault) override;
     RADIOLIB_PIN_TYPE diagCs = RADIOLIB_NC;
