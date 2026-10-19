@@ -35,6 +35,9 @@
 #endif
 #include "modules/AdminModule.h"
 #include "modules/CannedMessageModule.h"
+#include "modules/Telemetry/DeviceTelemetry.h"
+#include "gps/GeoCoord.h"
+#include "gps/RTC.h"
 #if !MESHTASTIC_EXCLUDE_MQTT
 #include "mqtt/MQTT.h"
 #endif
@@ -525,6 +528,142 @@ void menuHandler::settingsMenu()
                                                 [](const String &t) { saveOwnerName(t, true); });
         }
 #endif
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+// Node Actions > Details: what we know about one node, with the requests that refresh it.
+// Replies update the node DB; reopen Details to see them.
+void menuHandler::nodeDetailMenu()
+{
+    const meshtastic_NodeInfoLite *n = nodeDB->getMeshNode(menuHandler::pickedNodeNum);
+    if (!n)
+        return;
+    static char message[300];
+    size_t len = 0;
+    auto line = [&](const char *text) {
+        if (len < sizeof(message) - 1)
+            len += snprintf(message + len, sizeof(message) - len, "%s%s", len ? "\n" : "", text);
+    };
+    char buf[64];
+
+    if (nodeInfoLiteHasUser(n) && n->long_name[0])
+        snprintf(buf, sizeof(buf), "%s (%s)", n->long_name, n->short_name);
+    else
+        snprintf(buf, sizeof(buf), "!%08x", (unsigned)n->num);
+    line(buf);
+
+    const uint32_t now = getTime();
+    if (n->last_heard && now >= n->last_heard) {
+        const uint32_t ago = now - n->last_heard;
+        if (ago < 60)
+            snprintf(buf, sizeof(buf), "Heard just now");
+        else if (ago < 3600)
+            snprintf(buf, sizeof(buf), "Heard %lum ago", (unsigned long)(ago / 60));
+        else if (ago < 86400)
+            snprintf(buf, sizeof(buf), "Heard %luh ago", (unsigned long)(ago / 3600));
+        else
+            snprintf(buf, sizeof(buf), "Heard %lud ago", (unsigned long)(ago / 86400));
+    } else {
+        snprintf(buf, sizeof(buf), "Not heard yet");
+    }
+    line(buf);
+
+    if (n->has_hops_away && n->hops_away == 0) {
+        const float snr = n->snr != 0.0f ? n->snr : n->snr_q4 / 4.0f;
+        snprintf(buf, sizeof(buf), "Direct, SNR %.1f dB", snr);
+    } else if (n->has_hops_away) {
+        snprintf(buf, sizeof(buf), "%u hop%s away", (unsigned)n->hops_away, n->hops_away == 1 ? "" : "s");
+    } else {
+        snprintf(buf, sizeof(buf), "Hops unknown");
+    }
+    line(buf);
+
+    meshtastic_PositionLite theirs, ours;
+    const bool haveTheirs = nodeDB->hasValidPosition(n) && nodeDB->copyNodePosition(n->num, theirs);
+    const bool haveOurs = nodeDB->copyNodePosition(nodeDB->getNodeNum(), ours) && (ours.latitude_i || ours.longitude_i);
+    if (haveTheirs && haveOurs) {
+        const double tLat = theirs.latitude_i * 1e-7, tLon = theirs.longitude_i * 1e-7;
+        const double oLat = ours.latitude_i * 1e-7, oLon = ours.longitude_i * 1e-7;
+        const float m = GeoCoord::latLongToMeter(oLat, oLon, tLat, tLon);
+        float deg = GeoCoord::bearing(oLat, oLon, tLat, tLon) * 180.0f / (float)M_PI;
+        if (deg < 0)
+            deg += 360.0f;
+        static const char *const compass[] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+        const char *dir = compass[((int)((deg + 22.5f) / 45.0f)) % 8];
+        if (config.display.units == meshtastic_Config_DisplayConfig_DisplayUnits_IMPERIAL)
+            snprintf(buf, sizeof(buf), "%.1f mi %s", m / 1609.34f, dir);
+        else
+            snprintf(buf, sizeof(buf), "%.1f km %s", m / 1000.0f, dir);
+    } else if (haveTheirs) {
+        snprintf(buf, sizeof(buf), "Position known (ours is not)");
+    } else {
+        snprintf(buf, sizeof(buf), "No position");
+    }
+    line(buf);
+
+    meshtastic_DeviceMetrics dm;
+    if (nodeDB->copyNodeTelemetry(n->num, dm) && (dm.has_battery_level || dm.has_voltage || dm.has_uptime_seconds)) {
+        char bat[24] = "", up[24] = "";
+        if (dm.has_battery_level)
+            snprintf(bat, sizeof(bat), dm.battery_level > 100 ? "Powered" : "Bat %u%%", (unsigned)dm.battery_level);
+        if (dm.has_uptime_seconds) {
+            const uint32_t u = dm.uptime_seconds;
+            if (u >= 86400)
+                snprintf(up, sizeof(up), "up %lud %luh", (unsigned long)(u / 86400), (unsigned long)((u % 86400) / 3600));
+            else
+                snprintf(up, sizeof(up), "up %luh %lum", (unsigned long)(u / 3600), (unsigned long)((u % 3600) / 60));
+        }
+        snprintf(buf, sizeof(buf), "%s%s%s", bat, (bat[0] && up[0]) ? ", " : "", up);
+        line(buf);
+    } else {
+        line("No telemetry");
+    }
+    line(n->public_key.size == 32 ? "Key: yes (private DMs)" : "Key: not yet");
+
+    const bool ignored = nodeInfoLiteIsIgnored(n);
+    static const char *optionsArray[] = {"Back", "Request Position", "Request Telemetry", "Trace Route", "Ignore Node"};
+    optionsArray[4] = ignored ? "Unignore Node" : "Ignore Node";
+    enum optionsNumbers { Back = 0, ReqPosition, ReqTelemetry, Trace, Ignore };
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = message;
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 5;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        const NodeNum num = menuHandler::pickedNodeNum;
+        if (selected == ReqPosition) {
+            // Sends ours with want_response; the far side answers with its own (at most every 3 min)
+            service->trySendPosition(num, true);
+            screen->showSimpleBanner("Position requested", 2000);
+        } else if (selected == ReqTelemetry) {
+            if (deviceTelemetryModule && deviceTelemetryModule->requestFrom(num))
+                screen->showSimpleBanner("Telemetry requested", 2000);
+            else
+                screen->showSimpleBanner("Telemetry unavailable", 2000);
+        } else if (selected == Trace) {
+            if (traceRouteModule)
+                traceRouteModule->startTraceRoute(num); // result shows, then stays on the map 15 min
+        } else if (selected == Ignore) {
+            auto node = nodeDB->getMeshNode(num);
+            if (!node)
+                return;
+            bool changed = false;
+            if (nodeInfoLiteIsIgnored(node)) {
+                nodeInfoLiteSetBit(node, NODEINFO_BITFIELD_IS_IGNORED_MASK, false);
+                changed = true;
+            } else if (nodeDB->setProtectedFlag(node, NODEINFO_BITFIELD_IS_IGNORED_MASK, true)) {
+                changed = true;
+            } else {
+                LOG_WARN(NodeDB::PROTECTED_CAP_WARN_FMT, "ignore", num, MAX_NUM_NODES - 2);
+            }
+            if (changed) {
+                nodeDB->notifyObservers(true);
+                nodeDB->saveToDisk();
+            }
+            screen->setFrames(graphics::Screen::FOCUS_PRESERVE);
+        } else {
+            menuHandler::menuQueue = menuHandler::ManageNodeMenu;
+            screen->runNow();
+        }
     };
     screen->showOverlayBanner(bannerOptions);
 }
@@ -2037,10 +2176,14 @@ void menuHandler::manageNodeMenu()
     if (!node) {
         return;
     }
-    enum optionsNumbers { Back, Favorite, Mute, TraceRoute, KeyVerification, Ignore, enumEnd };
+    enum optionsNumbers { Back, Favorite, Mute, TraceRoute, KeyVerification, Ignore, Details, enumEnd };
     static const char *optionsArray[enumEnd] = {"Back"};
     static int optionsEnumArray[enumEnd] = {Back};
     int options = 1;
+#ifdef LCDWIKI_EXTRAS
+    optionsArray[options] = "Details";
+    optionsEnumArray[options++] = Details;
+#endif
 
     if (nodeInfoLiteIsFavorite(node)) {
         optionsArray[options] = "Unfavorite";
@@ -2090,6 +2233,13 @@ void menuHandler::manageNodeMenu()
             screen->runNow();
             return;
         }
+#ifdef LCDWIKI_EXTRAS
+        if (selected == Details) {
+            menuQueue = NodeDetailMenu;
+            screen->runNow();
+            return;
+        }
+#endif
 
         if (selected == Favorite) {
             const auto *n = nodeDB->getMeshNode(menuHandler::pickedNodeNum);
@@ -3602,6 +3752,9 @@ void menuHandler::handleMenuSwitch(OLEDDisplay *display)
         break;
     case SettingsMenu:
         settingsMenu();
+        break;
+    case NodeDetailMenu:
+        nodeDetailMenu();
         break;
 #endif
     case FrequencySlot:

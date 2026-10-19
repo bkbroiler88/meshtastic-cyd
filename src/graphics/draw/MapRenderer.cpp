@@ -13,6 +13,9 @@
 #include "input/InputBroker.h"
 #include "main.h"
 #include "mesh/Throttle.h"
+#ifdef LCDWIKI_EXTRAS
+#include "modules/TraceRouteModule.h"
+#endif
 #include <cmath>
 #include <cstdint>
 
@@ -127,6 +130,154 @@ bool plottable(const meshtastic_NodeInfoLite *n)
 {
     return n && n->num != nodeDB->getNodeNum() && nodeDB->hasValidPosition(n);
 }
+
+#ifdef LCDWIKI_EXTRAS
+// ---------------------------------------------------------------------------
+// Last traceroute, drawn as a path: us -> each hop -> target, each leg coloured by the SNR
+// measured where it arrived. A hop with no known position is bridged with a dashed grey leg.
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t kRouteShowMs = 15UL * 60UL * 1000UL;
+
+const TraceRouteModule::RouteResult *visibleRoute()
+{
+    if (!traceRouteModule)
+        return nullptr;
+    const TraceRouteModule::RouteResult &r = traceRouteModule->lastRoute();
+    if (!r.atMs || millis() - r.atMs > kRouteShowMs)
+        return nullptr;
+    return &r;
+}
+
+uint16_t snrColour(int8_t q4)
+{
+    if (q4 == INT8_MIN)
+        return 0x8410; // grey: not measured
+    const float db = q4 / 4.0f;
+    if (db >= 0.0f)
+        return 0x3E8F; // green
+    if (db >= -10.0f)
+        return 0xFD20; // amber
+    return 0xF800;     // red
+}
+
+/// Screen position of a route node; false if it has none. Off-screen points are fine (clipped).
+bool routePoint(const MapView &v, NodeNum num, int16_t &x, int16_t &y)
+{
+    double lat, lon;
+    if (num == nodeDB->getNodeNum()) {
+        lat = v.originLat;
+        lon = v.originLon;
+    } else {
+        const meshtastic_NodeInfoLite *n = (num == NODENUM_BROADCAST) ? nullptr : nodeDB->getMeshNode(num);
+        meshtastic_PositionLite np;
+        if (!n || !nodeDB->hasValidPosition(n) || !nodeDB->copyNodePosition(num, np))
+            return false;
+        lat = DegD(np.latitude_i);
+        lon = DegD(np.longitude_i);
+    }
+    const ScreenPt p = project(v, lat, lon);
+    x = p.x;
+    y = p.y;
+    return true;
+}
+
+/// Liang-Barsky clip to the map band, so a leg never draws outside the rows it owns.
+bool clipToBand(const MapView &v, float &x0, float &y0, float &x1, float &y1)
+{
+    const float xmin = 0, xmax = scrW - 1, ymin = v.top, ymax = v.bottom - 1;
+    float t0 = 0, t1 = 1;
+    const float dx = x1 - x0, dy = y1 - y0;
+    const float p[4] = {-dx, dx, -dy, dy};
+    const float q[4] = {x0 - xmin, xmax - x0, y0 - ymin, ymax - y0};
+    for (int i = 0; i < 4; i++) {
+        if (p[i] == 0) {
+            if (q[i] < 0)
+                return false;
+            continue;
+        }
+        const float t = q[i] / p[i];
+        if (p[i] < 0) {
+            if (t > t1)
+                return false;
+            if (t > t0)
+                t0 = t;
+        } else {
+            if (t < t0)
+                return false;
+            if (t < t1)
+                t1 = t;
+        }
+    }
+    const float nx0 = x0 + t0 * dx, ny0 = y0 + t0 * dy;
+    x1 = x0 + t1 * dx;
+    y1 = y0 + t1 * dy;
+    x0 = nx0;
+    y0 = ny0;
+    return true;
+}
+
+void routeLeg(OLEDDisplay *display, const MapView &v, bool bandDirect, int16_t ax, int16_t ay, int16_t bx, int16_t by,
+              uint16_t colour, bool dashed)
+{
+    float x0 = ax, y0 = ay, x1 = bx, y1 = by;
+    if (!clipToBand(v, x0, y0, x1, y1))
+        return;
+    const float len = sqrtf((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0));
+    const int pieces = dashed ? (int)(len / 10.0f) + 1 : 1;
+    for (int k = 0; k < pieces; k++) {
+        // Dashed: 6 px on, 4 px off
+        const float s0 = dashed ? (k * 10.0f) / len : 0.0f;
+        float s1 = dashed ? (k * 10.0f + 6.0f) / len : 1.0f;
+        if (s0 >= 1.0f)
+            break;
+        if (s1 > 1.0f)
+            s1 = 1.0f;
+        const int16_t sx = (int16_t)lroundf(x0 + (x1 - x0) * s0), sy = (int16_t)lroundf(y0 + (y1 - y0) * s0);
+        const int16_t ex = (int16_t)lroundf(x0 + (x1 - x0) * s1), ey = (int16_t)lroundf(y0 + (y1 - y0) * s1);
+#if defined(MESHTASTIC_MAP_DIRECT_COLOR)
+        if (bandDirect) {
+            graphics::tftDirectLine(sx, sy, ex, ey, colour, 2);
+            continue;
+        }
+#endif
+        display->drawLine(sx, sy, ex, ey);
+    }
+}
+
+void drawRoute(OLEDDisplay *display, const MapView &v, bool bandDirect)
+{
+    const TraceRouteModule::RouteResult *r = visibleRoute();
+    if (!r)
+        return;
+    // Path: us, the hops in order, the target
+    NodeNum path[10];
+    uint8_t n = 0;
+    path[n++] = nodeDB->getNodeNum();
+    for (uint8_t i = 0; i < r->hopCount; i++)
+        path[n++] = r->via[i];
+    path[n++] = r->target;
+
+    int16_t px = 0, py = 0;
+    bool havePrev = routePoint(v, path[0], px, py);
+    bool gap = false;
+    for (uint8_t k = 1; k < n; k++) {
+        int16_t x, y;
+        if (!routePoint(v, path[k], x, y)) {
+            gap = true; // no position: bridge to the next node that has one
+            continue;
+        }
+        if (havePrev) {
+            const int8_t q4 = (k - 1 < r->snrCount) ? r->snrQ4[k - 1] : INT8_MIN;
+            routeLeg(display, v, bandDirect, px, py, x, y, gap ? 0x8410 : snrColour(q4), gap);
+        }
+        px = x;
+        py = y;
+        havePrev = true;
+        gap = false;
+    }
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Drawing helpers
@@ -356,6 +507,11 @@ void MapRenderer::drawMapFrame(OLEDDisplay *display, OLEDDisplayUiState *state, 
                       (uint32_t)(n->last_heard / 30); // 30 s buckets: "stale" flips slowly
         }
     }
+#ifdef LCDWIKI_EXTRAS
+    // A traceroute arriving, or expiring off the map, changes the picture
+    if (const TraceRouteModule::RouteResult *route = visibleRoute())
+        bandSig = bandSig * 2654435761u + route->atMs;
+#endif
     bandSig ^= graphics::tftFullRepaintCounter() * 2654435761u; // repainted over? draw again
 
     static uint32_t lastBandSig = 0;
@@ -410,6 +566,12 @@ void MapRenderer::drawMapFrame(OLEDDisplay *display, OLEDDisplayUiState *state, 
     // because there is no gesture free to select with.
     meshtastic_NodeInfoLite *nearest = nullptr;
     float nearestM = 0.0f;
+
+#ifdef LCDWIKI_EXTRAS
+    // Under the markers, so node dots and names stay readable on top of the path
+    if (drawBand)
+        drawRoute(display, v, bandDirect);
+#endif
 
     for (size_t i = 0; drawBand && showNodes && i < nodeDB->getNumMeshNodes(); i++) {
         meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);

@@ -38,6 +38,17 @@ class TraceRouteModule : public ProtobufModule<meshtastic_RouteDiscovery>,
 
     void processUpgradedPacket(const meshtastic_MeshPacket &mp);
 
+    /// The outbound path of the last completed traceroute, kept for drawing on the map.
+    struct RouteResult {
+        NodeNum target = 0;
+        uint8_t hopCount = 0; // intermediate hops in `via`, in order from us
+        NodeNum via[8] = {};
+        int8_t snrQ4[9] = {}; // dB*4 measured on arrival at via[k], the last at the target; INT8_MIN = unknown
+        uint8_t snrCount = 0;
+        uint32_t atMs = 0; // millis() when it completed; 0 = none yet
+    };
+    const RouteResult &lastRoute() const { return lastRouteResult; }
+
   protected:
     bool handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshtastic_RouteDiscovery *r) override;
 
@@ -50,6 +61,8 @@ class TraceRouteModule : public ProtobufModule<meshtastic_RouteDiscovery>,
     virtual int32_t runOnce() override;
 
   private:
+    RouteResult lastRouteResult;
+
     void setResultText(const String &text);
     void clearResultLines();
 #if HAS_SCREEN

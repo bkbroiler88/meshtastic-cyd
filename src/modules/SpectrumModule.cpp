@@ -142,6 +142,10 @@ int32_t SpectrumModule::runOnce()
     if (needChrome) {
         drawChrome();
         needChrome = false;
+        needLabels = false;
+    } else if (needLabels) {
+        drawDbmLabels();
+        needLabels = false;
     }
 
     if (mode == Mode::TestTx) {
@@ -190,11 +194,9 @@ void SpectrumModule::runSweepChunk()
     const uint32_t took = millis() - sweepStartMs;
     sweepMsTenths = took ? (uint16_t)(10000UL / took) : 0;
 
-    int32_t sum = 0;
     int8_t lo = 0, hi = -128;
     uint16_t hiBin = 0;
     for (uint16_t i = 0; i < nBins; i++) {
-        sum += cur[i];
         if (cur[i] < lo)
             lo = cur[i];
         if (cur[i] > hi) {
@@ -202,17 +204,24 @@ void SpectrumModule::runSweepChunk()
             hiBin = i;
         }
     }
-    // Floor = mean of the bins at or below the overall mean, so a few strong signals do not lift it
-    const int16_t mean = (int16_t)(sum / nBins);
-    int32_t quietSum = 0;
-    uint16_t quietN = 0;
-    for (uint16_t i = 0; i < nBins; i++) {
-        if (cur[i] <= mean) {
-            quietSum += cur[i];
-            quietN++;
+    // Floor = the 25th-percentile level. A strong nearby transmitter can fill much of a zoomed
+    // span (and lift neighbouring bins), which dragged a mean-based floor up and rescaled the
+    // graph mid-test; the quietest quarter of the bins is not moved by it.
+    {
+        uint16_t hist[129] = {0}; // dBm -128..0
+        for (uint16_t i = 0; i < nBins; i++)
+            hist[cur[i] + 128]++;
+        const uint16_t want = nBins / 4 + 1;
+        uint16_t seen = 0;
+        floorDbm = -128;
+        for (int16_t b = 0; b <= 128; b++) {
+            seen += hist[b];
+            if (seen >= want) {
+                floorDbm = b - 128;
+                break;
+            }
         }
     }
-    floorDbm = quietN ? (int16_t)(quietSum / quietN) : mean;
     if (millis() - lastStatsMs > 1000) {
         lastStatsMs = millis();
         const uint32_t hiHz = binHz(hiBin);
@@ -488,15 +497,10 @@ void SpectrumModule::drawChrome()
             lx = W - w;
         graphics::tftDirectTextF(lx, plotY1 + 4, buf, LABEL, C_BLACK, TftFont::Small);
     }
-    if (view == View::Spectrum) {
-        for (int16_t d = viewTop - 10; d > viewBottom; d -= 20) {
-            snprintf(buf, sizeof(buf), "%d", d);
-            const int16_t w = graphics::tftDirectTextWidthF(buf, TftFont::Small);
-            graphics::tftDirectTextF(plotX0 - 4 - w, dbmY(d, plotY0, plotY1) - th / 2, buf, LABEL, C_BLACK, TftFont::Small);
-        }
-    } else {
+    if (view == View::Spectrum)
+        drawDbmLabels();
+    else
         wfRow = 0;
-    }
 }
 
 // One bin's column, painted top-down in a single pass: black above the level, green below.
@@ -582,19 +586,48 @@ void SpectrumModule::setSpan(bool zoom)
 // chrome redraw), so it only happens when the floor drifts out of a band around that point.
 void SpectrumModule::rescaleToFloor(bool force)
 {
-    if (!force && floorDbm >= viewBottom + 4 && floorDbm <= viewBottom + 18)
-        return;
+    if (!force) {
+        // A board whose floor swings (the 2.8" does) would otherwise rescale every few sweeps.
+        // Only act on a floor that has stayed out of band for a while, and not too often.
+        if (floorDbm >= viewBottom + 4 && floorDbm <= viewBottom + 18) {
+            outOfBandSweeps = 0;
+            return;
+        }
+        if (++outOfBandSweeps < 5 || millis() - lastRescaleMs < 10000)
+            return;
+    }
     const int16_t below = -(floorDbm - 10);
     int16_t bottom = (int16_t)(-((below + 9) / 10) * 10);
     if (bottom < -140)
         bottom = -140;
     if (bottom > -60)
         bottom = -60;
+    outOfBandSweeps = 0;
     if (!force && bottom == viewBottom)
         return;
+    LOG_INFO("Spectrum: rescale, floor %d dBm -> axis %d..%d", floorDbm, bottom, bottom + VIEW_SPAN);
     viewBottom = (int8_t)bottom;
     viewTop = (int8_t)(bottom + VIEW_SPAN);
-    needChrome = true;
+    lastRescaleMs = millis();
+    if (force)
+        needChrome = true; // end of the splash: draw the real screen
+    else
+        needLabels = true; // the bars repaint themselves on the next pass
+}
+
+// The dBm scale down the left edge; cleared first because a rescale changes every number
+void SpectrumModule::drawDbmLabels()
+{
+    if (view != View::Spectrum)
+        return;
+    const int16_t th = graphics::tftDirectTextHeightF(TftFont::Small);
+    graphics::tftDirectFillRect(0, plotY0 - th / 2, plotX0 - 1, plotY1 - plotY0 + th, C_BLACK);
+    char buf[8];
+    for (int16_t d = viewTop - 10; d > viewBottom; d -= 20) {
+        snprintf(buf, sizeof(buf), "%d", d);
+        const int16_t w = graphics::tftDirectTextWidthF(buf, TftFont::Small);
+        graphics::tftDirectTextF(plotX0 - 4 - w, dbmY(d, plotY0, plotY1) - th / 2, buf, LABEL, C_BLACK, TftFont::Small);
+    }
 }
 
 void SpectrumModule::drawSplash()

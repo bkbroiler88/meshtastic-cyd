@@ -184,6 +184,25 @@ void DeviceTelemetryModule::sendLocalStatsToPhone()
     service->sendToPhone(p);
 }
 
+DeviceTelemetryModule *deviceTelemetryModule;
+
+bool DeviceTelemetryModule::requestFrom(NodeNum dest)
+{
+    // An empty device_metrics telemetry with want_response: allocReply() on the far side answers it
+    meshtastic_Telemetry req = meshtastic_Telemetry_init_zero;
+    req.which_variant = meshtastic_Telemetry_device_metrics_tag;
+    meshtastic_MeshPacket *p = allocDataProtobuf(req);
+    if (!p)
+        return false;
+    p->to = dest;
+    p->decoded.want_response = true;
+    if (const meshtastic_NodeInfoLite *n = nodeDB->getMeshNode(dest))
+        p->channel = n->channel;
+    LOG_INFO("Request device telemetry from 0x%08x", dest);
+    service->sendToMesh(p, RX_SRC_LOCAL, true);
+    return true;
+}
+
 bool DeviceTelemetryModule::sendTelemetry(NodeNum dest, bool phoneOnly)
 {
     meshtastic_Telemetry telemetry = getDeviceTelemetry();

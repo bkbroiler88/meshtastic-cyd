@@ -6,6 +6,9 @@
 #include <OLEDDisplay.h>
 #include <OLEDDisplayUi.h>
 
+class DeviceTelemetryModule;
+extern DeviceTelemetryModule *deviceTelemetryModule;
+
 class DeviceTelemetryModule : private concurrency::OSThread,
                               public BaseTelemetryModule,
                               public ProtobufModule<meshtastic_Telemetry>
@@ -20,8 +23,12 @@ class DeviceTelemetryModule : private concurrency::OSThread,
     {
         nodeStatusObserver.observe(&nodeStatus->onNewStatus);
         setIntervalFromNow(setStartDelay()); // Wait until NodeInfo is sent
+        deviceTelemetryModule = this;
     }
     virtual bool wantUIFrame() { return false; }
+
+    /// Ask `dest` for its device metrics (battery, voltage, uptime). The reply lands in the node DB.
+    bool requestFrom(NodeNum dest);
 
   protected:
     /** Called to handle a particular incoming message

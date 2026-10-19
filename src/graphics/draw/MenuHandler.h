@@ -81,6 +81,7 @@ class menuHandler
         TxPowerPicker,
         HopLimitPicker,
         SettingsMenu,
+        NodeDetailMenu,
 #endif
 #if HAS_LORA_FEM
         LoraFemLnaToggleMenu
@@ -111,6 +112,7 @@ class menuHandler
     static void txPowerPicker();
     static void hopLimitPicker();
     static void settingsMenu();
+    static void nodeDetailMenu();
 #endif
     static void FrequencySlotPicker();
     static void handleMenuSwitch(OLEDDisplay *display);

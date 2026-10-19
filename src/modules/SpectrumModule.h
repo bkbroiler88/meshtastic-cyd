@@ -93,7 +93,7 @@ class SpectrumModule : public MeshModule, private concurrency::OSThread
     uint16_t cursorBin = 39;    // 906.875 MHz, the US LongFast default slot
     int16_t floorDbm = -120;    // mean of the last sweep: the waterfall colours relative to it
     // Bar-graph scale, rebased on the noise floor so a quiet band does not sit as a sliver at the bottom
-    static constexpr int8_t VIEW_SPAN = 70;
+    static constexpr int8_t VIEW_SPAN = 100; // room above the floor for a strong test transmitter close by
     int8_t viewBottom = -130;
     int8_t viewTop = -60;
     // Sweeps left in the "Setting noise floor" splash before the graph is drawn
@@ -101,6 +101,10 @@ class SpectrumModule : public MeshModule, private concurrency::OSThread
     uint8_t calibrationLeft = 0;
     int32_t calibrationSum = 0;
     void rescaleToFloor(bool force);
+    void drawDbmLabels();
+    bool needLabels = false;       // relabel the dBm axis only (a rescale), no full redraw
+    uint8_t outOfBandSweeps = 0;   // consecutive sweeps with the floor outside the comfortable band
+    uint32_t lastRescaleMs = 0;
     void drawSplash();
     uint16_t sweepFails = 0;    // bins in the last sweep whose SPI read failed
     uint32_t lastStatsMs = 0;

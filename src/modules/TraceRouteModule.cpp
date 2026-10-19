@@ -185,6 +185,16 @@ void TraceRouteModule::alterReceivedProtobuf(meshtastic_MeshPacket &p, meshtasti
         if (isResponseFromTarget || isRequestToUs || (containsTargetNode && hasCompleteRoute)) {
             LOG_INFO("TracRoute result detected: isResponseFromTarget=%d, isRequestToUs=%d", isResponseFromTarget, isRequestToUs);
 
+            // Keep the path itself, not just the text below, so the map can draw it
+            lastRouteResult.target = tracingNode;
+            lastRouteResult.hopCount = r->route_count < 8 ? r->route_count : 8;
+            for (uint8_t i = 0; i < lastRouteResult.hopCount; i++)
+                lastRouteResult.via[i] = r->route[i];
+            lastRouteResult.snrCount = r->snr_towards_count < 9 ? r->snr_towards_count : 9;
+            for (uint8_t i = 0; i < lastRouteResult.snrCount; i++)
+                lastRouteResult.snrQ4[i] = r->snr_towards[i];
+            lastRouteResult.atMs = millis() ? millis() : 1;
+
             LOG_INFO("SNR arrays - towards_count=%d, back_count=%d", r->snr_towards_count, r->snr_back_count);
             for (int i = 0; i < r->snr_towards_count; i++) {
                 LOG_INFO("SNR towards[%d] = %d (%.1fdB)", i, r->snr_towards[i], (float)r->snr_towards[i] / 4.0f);
