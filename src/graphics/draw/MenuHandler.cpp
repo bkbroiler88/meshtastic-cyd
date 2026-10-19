@@ -28,7 +28,7 @@
 #include "mesh/RadioLibInterface.h"
 #include "mesh/RadioTuning.h"
 #include "modules/SpectrumModule.h"
-#if defined(SPECTRUM_ANALYZER) && defined(MESHTASTIC_MAP_DIRECT_COLOR)
+#if defined(SPECTRUM_ANALYZER)
 #define HAS_SPECTRUM_MENU 1
 #else
 #define HAS_SPECTRUM_MENU 0

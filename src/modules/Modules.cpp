@@ -223,7 +223,7 @@ void setupModules()
         gamesModule = new GamesModule();
     }
 #endif
-#if HAS_SCREEN && defined(SPECTRUM_ANALYZER) && defined(MESHTASTIC_MAP_DIRECT_COLOR)
+#if HAS_SCREEN && defined(SPECTRUM_ANALYZER)
     if (config.display.displaymode != meshtastic_Config_DisplayConfig_DisplayMode_COLOR) {
         spectrumModule = new SpectrumModule();
     }

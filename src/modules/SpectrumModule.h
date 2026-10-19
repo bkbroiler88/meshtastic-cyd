@@ -2,8 +2,21 @@
 
 #include "configuration.h"
 
-// Draws through the TFT direct-colour layer, which only exists on MESHTASTIC_MAP_DIRECT_COLOR builds
-#if HAS_SCREEN && defined(SPECTRUM_ANALYZER) && defined(MESHTASTIC_MAP_DIRECT_COLOR)
+#if HAS_SCREEN && defined(SPECTRUM_ANALYZER)
+
+// Colour TFT boards (the LCDWIKI CYDs) draw straight to the panel through the direct-colour layer
+// and own the whole screen; everything else (e.g. the Heltec V3's 128x64 OLED) gets an ordinary
+// BaseUI frame drawn into the 1-bit framebuffer.
+#if defined(MESHTASTIC_MAP_DIRECT_COLOR)
+#define SPECTRUM_DIRECT 1
+#else
+#define SPECTRUM_DIRECT 0
+#endif
+
+// Highest Test Transmit level offered, in dBm at the antenna (an E22-900M30S reaches ~30)
+#ifndef SPECTRUM_TEST_MAX_DBM
+#define SPECTRUM_TEST_MAX_DBM 30
+#endif
 
 #include "Observer.h"
 #include "concurrency/OSThread.h"
@@ -18,7 +31,7 @@
  * Long-press opens the options banner; tap moves the cursor. The radio returns to the mesh only
  * through "Exit to Mesh" - by request there is no inactivity timeout.
  */
-class SpectrumModule : public MeshModule, private concurrency::OSThread
+class SpectrumModule : public MeshModule, public Observable<const UIFrameEvent *>, private concurrency::OSThread
 {
   public:
     SpectrumModule();
@@ -29,6 +42,13 @@ class SpectrumModule : public MeshModule, private concurrency::OSThread
 
     bool wantPacket(const meshtastic_MeshPacket *p) override { return false; }
     bool interceptingKeyboardInput() override { return isActive(); }
+
+    // Mono builds show the analyzer as a frame of its own while it is open
+    bool wantUIFrame() override { return !SPECTRUM_DIRECT && isActive(); }
+    Observable<const UIFrameEvent *> *getUIFrameObservable() override { return this; }
+#if !SPECTRUM_DIRECT
+    void drawFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y) override;
+#endif
 
   protected:
     int32_t runOnce() override;
@@ -109,6 +129,17 @@ class SpectrumModule : public MeshModule, private concurrency::OSThread
     uint16_t sweepFails = 0;    // bins in the last sweep whose SPI read failed
     uint32_t lastStatsMs = 0;
     uint32_t lastAwakeKickMs = 0;
+
+    // Strongest reading of the last few seconds, for the peak readout (and the log)
+    int8_t recentPeakDbm = DBM_BOTTOM;
+    uint32_t recentPeakHz = 0;
+    uint32_t recentPeakMs = 0;
+    void notePeak(int8_t dbm, uint32_t hz);
+
+    void framesChanged(); // mono: add/remove the analyzer frame
+    void requestRedraw(); // mono: repaint the frame (throttled)
+    uint32_t lastRedrawMs = 0;
+    void nextPeak(); // mono: button press moves the cursor to the next strong peak
 
     // Test transmit
     int8_t testDbm = 0;

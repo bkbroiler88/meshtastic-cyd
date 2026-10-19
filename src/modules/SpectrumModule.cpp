@@ -1,19 +1,24 @@
 #include "SpectrumModule.h"
 
-#if HAS_SCREEN && defined(SPECTRUM_ANALYZER) && defined(MESHTASTIC_MAP_DIRECT_COLOR)
+#if HAS_SCREEN && defined(SPECTRUM_ANALYZER)
 
 #include "PowerFSM.h"
 #include "graphics/Screen.h"
-#include "graphics/TFTDisplay.h"
 #include "main.h"
 #include "mesh/RadioLibInterface.h"
-
+#if SPECTRUM_DIRECT
+#include "graphics/TFTDisplay.h"
 using graphics::TftFont;
+#else
+#include "graphics/ScreenFonts.h"
+#include "graphics/SharedUIDisplay.h"
+#endif
 
 SpectrumModule *spectrumModule;
 
 namespace
 {
+#if SPECTRUM_DIRECT
 constexpr uint16_t C_BLACK = 0x0000;
 constexpr uint16_t C_WHITE = 0xFFFF;
 constexpr uint16_t HEADER_GREY = 0x4208; // BaseUI title bar
@@ -47,6 +52,7 @@ uint16_t heat(int8_t dbm)
     const uint8_t *b = stops[k + 1 < n ? k + 1 : k];
     return rgb565(a[0] + ((b[0] - a[0]) * u >> 8), a[1] + ((b[1] - a[1]) * u >> 8), a[2] + ((b[2] - a[2]) * u >> 8));
 }
+#endif
 
 RadioLibInterface *radio()
 {
@@ -83,8 +89,12 @@ void SpectrumModule::start()
     calibrationLeft = CALIBRATION_SWEEPS;
     calibrationSum = 0;
     mode = Mode::Sweep;
+    recentPeakDbm = DBM_BOTTOM;
+#if SPECTRUM_DIRECT
     layout();
+#endif
     screen->setModalModule(this);
+    framesChanged();
     // Called from the confirm banner's callback: wait for that banner to close before drawing
     bannerOpen = true;
     needChrome = true;
@@ -103,7 +113,10 @@ void SpectrumModule::stop()
     if (radio())
         radio()->spectrumEnd();
     LOG_INFO("Spectrum: radio returned to the mesh");
+#if SPECTRUM_DIRECT
     graphics::tftReleaseDirectRows(); // the release itself queues a full repaint of the 1-bit UI
+#endif
+    framesChanged();
     if (screen) {
         screen->clearModalModule(this);
         screen->forceDisplay(true);
@@ -138,6 +151,7 @@ int32_t SpectrumModule::runOnce()
     // End row is exclusive. While the whole panel is reserved, the 1-bit UI's full repaints skip it
     // (TFTDisplay leaves reserved rows alone), so they are not a reason to redraw: doing so blanked
     // the screen on every UI repaint. Chrome is redrawn only on our own state changes.
+#if SPECTRUM_DIRECT
     graphics::tftReserveDirectRows(0, H, 3000);
     if (needChrome) {
         drawChrome();
@@ -147,6 +161,9 @@ int32_t SpectrumModule::runOnce()
         drawDbmLabels();
         needLabels = false;
     }
+#else
+    needChrome = needLabels = false; // the frame is drawn whole every time
+#endif
 
     if (mode == Mode::TestTx) {
         runTestTx();
@@ -183,8 +200,10 @@ void SpectrumModule::runSweepChunk()
             peak[sweepBin] = d;
         // Paint this bin now rather than the whole graph at the end of the sweep: the display
         // refreshes continuously left to right instead of jumping a few times a second
+#if SPECTRUM_DIRECT
         if (!calibrationLeft && !needChrome)
             drawColumn(sweepBin);
+#endif
         sweepBin++;
     }
     if (sweepBin < nBins)
@@ -222,6 +241,7 @@ void SpectrumModule::runSweepChunk()
             }
         }
     }
+    notePeak(hi, binHz(hiBin));
     if (millis() - lastStatsMs > 1000) {
         lastStatsMs = millis();
         const uint32_t hiHz = binHz(hiBin);
@@ -241,11 +261,15 @@ void SpectrumModule::runSweepChunk()
             LOG_INFO("Spectrum: noise floor %d dBm", floorDbm);
             rescaleToFloor(true);
         }
+#if !SPECTRUM_DIRECT
+        requestRedraw();
+#endif
         return;
     }
     if (lo != hi) // a flat sweep is a dead reading, not a floor: do not rescale (and redraw) on it
         rescaleToFloor(false);
 
+#if SPECTRUM_DIRECT
     if (view == View::Waterfall && !needChrome)
         finishWaterfallRow();
 
@@ -255,6 +279,9 @@ void SpectrumModule::runSweepChunk()
     snprintf(right, sizeof(right), "%lu.%03lu MHz  %d dBm", (unsigned long)(hz / 1000000UL),
              (unsigned long)((hz / 1000UL) % 1000UL), smooth ? disp[cursorBin] : cur[cursorBin]);
     drawHeader(left, right);
+#else
+    requestRedraw();
+#endif
 }
 
 void SpectrumModule::beginTestTx(int8_t dbm)
@@ -280,7 +307,11 @@ void SpectrumModule::runTestTx()
             testInFlight = false;
             testSent++;
             testNextMs = now + TEST_SPACING_MS;
+#if SPECTRUM_DIRECT
             drawTestTx();
+#else
+            requestRedraw();
+#endif
         } else if (now - testStartedMs > 3000) {
             LOG_WARN("Spectrum: test packet %u never reported TX done", testSent + 1);
             testInFlight = false;
@@ -326,6 +357,10 @@ int SpectrumModule::handleInputEvent(const InputEvent *event)
         openOptions(); // touch long-press arrives as SELECT
         return 1;
     }
+    if (ev == INPUT_BROKER_USER_PRESS && mode == Mode::Sweep && !event->touchX && !event->touchY) {
+        nextPeak(); // a physical button (the Heltec's): step the cursor through the strong peaks
+        return 1;
+    }
     if (ev == INPUT_BROKER_USER_PRESS && mode == Mode::Sweep && (event->touchX || event->touchY)) {
         const int16_t x = event->touchX;
         if (x >= plotX0 && x < plotX1) {
@@ -347,14 +382,34 @@ void SpectrumModule::openOptions()
     snprintf(spanLine, sizeof(spanLine), "Span: %s", nBins == BINS ? "Full Band" : "Zoom 4 MHz");
     snprintf(smoothLine, sizeof(smoothLine), "Smoothing: %s", smooth ? "On" : "Off");
     snprintf(peakLine, sizeof(peakLine), "Peak Hold: %s", peakHold ? "On" : "Off");
-    static const char *options[] = {"Back",   viewLine,      spanLine,        smoothLine,
-                                    peakLine, "Clear Peaks", "Test Transmit", "Exit to Mesh"};
-    enum { Back, ViewToggle, SpanToggle, SmoothToggle, PeakToggle, ClearPeaks, TestTx, Exit };
+    enum { Back, ViewToggle, SpanToggle, SmoothToggle, PeakToggle, ClearPeaks, TestTx, Exit, OptionEnd };
+    static const char *options[OptionEnd];
+    static int optionEnums[OptionEnd];
+    int n = 0;
+    options[n] = "Back";
+    optionEnums[n++] = Back;
+#if SPECTRUM_DIRECT
+    options[n] = viewLine; // a waterfall needs colour: the mono screen shows a peak readout instead
+    optionEnums[n++] = ViewToggle;
+#endif
+    options[n] = spanLine;
+    optionEnums[n++] = SpanToggle;
+    options[n] = smoothLine;
+    optionEnums[n++] = SmoothToggle;
+    options[n] = peakLine;
+    optionEnums[n++] = PeakToggle;
+    options[n] = "Clear Peaks";
+    optionEnums[n++] = ClearPeaks;
+    options[n] = "Test Transmit";
+    optionEnums[n++] = TestTx;
+    options[n] = "Exit to Mesh";
+    optionEnums[n++] = Exit;
 
     graphics::BannerOverlayOptions b;
     b.message = "Spectrum";
     b.optionsArrayPtr = options;
-    b.optionsCount = 8;
+    b.optionsEnumPtr = optionEnums;
+    b.optionsCount = n;
     b.bannerCallback = [this](int selected) {
         switch (selected) {
         case ViewToggle:
@@ -383,15 +438,19 @@ void SpectrumModule::openOptions()
         }
     };
     bannerOpen = true;
+#if SPECTRUM_DIRECT
     graphics::tftReleaseDirectRows();
+#endif
     screen->showOverlayBanner(b);
 }
 
 void SpectrumModule::openTestTxMenu()
 {
-    // Antenna power through the E22's PA. The other board watches this in its Spectrum view.
-    static const char *options[] = {"Back", "10 dBm", "20 dBm", "30 dBm (max)"};
-    static const int8_t levels[] = {0, 10, 20, 30};
+    // Antenna power (through the board's PA, if any). The other board watches it in its Spectrum view.
+    static char maxLine[20];
+    snprintf(maxLine, sizeof(maxLine), "%d dBm (max)", SPECTRUM_TEST_MAX_DBM);
+    static const char *options[] = {"Back", "10 dBm", "20 dBm", maxLine};
+    static const int8_t levels[] = {0, 10, 20, SPECTRUM_TEST_MAX_DBM};
     graphics::BannerOverlayOptions b;
     b.message = "Test Transmit";
     b.optionsArrayPtr = options;
@@ -401,7 +460,9 @@ void SpectrumModule::openTestTxMenu()
             beginTestTx(levels[selected]);
     };
     bannerOpen = true;
+#if SPECTRUM_DIRECT
     graphics::tftReleaseDirectRows();
+#endif
     screen->showOverlayBanner(b);
 }
 
@@ -409,6 +470,7 @@ void SpectrumModule::openTestTxMenu()
 // Drawing
 // ---------------------------------------------------------------------------------------
 
+#if SPECTRUM_DIRECT
 void SpectrumModule::layout()
 {
     W = screen->getWidth();
@@ -429,6 +491,8 @@ int16_t SpectrumModule::binX(uint16_t bin) const
     return plotX0 + (int16_t)((int32_t)(plotX1 - plotX0) * bin / nBins);
 }
 
+#endif
+
 int16_t SpectrumModule::dbmY(int16_t dbm, int16_t top, int16_t bottom) const
 {
     if (dbm > viewTop)
@@ -438,6 +502,7 @@ int16_t SpectrumModule::dbmY(int16_t dbm, int16_t top, int16_t bottom) const
     return top + (int16_t)((int32_t)(viewTop - dbm) * (bottom - top) / (viewTop - viewBottom));
 }
 
+#if SPECTRUM_DIRECT
 void SpectrumModule::drawHeader(const char *left, const char *right)
 {
     char key[sizeof(lastHeader)];
@@ -556,6 +621,8 @@ void SpectrumModule::finishWaterfallRow()
     graphics::tftDirectFillRect(plotX0, wfY0 + wfRow * 2, plotX1 - plotX0, 1, C_WHITE); // "now" marker
 }
 
+#endif
+
 void SpectrumModule::setSpan(bool zoom)
 {
     // Keep the cursor's frequency, and centre the zoom window on it where the band edge allows
@@ -615,6 +682,7 @@ void SpectrumModule::rescaleToFloor(bool force)
         needLabels = true; // the bars repaint themselves on the next pass
 }
 
+#if SPECTRUM_DIRECT
 // The dBm scale down the left edge; cleared first because a rescale changes every number
 void SpectrumModule::drawDbmLabels()
 {
@@ -655,5 +723,137 @@ void SpectrumModule::drawTestTx()
     const int16_t hw = graphics::tftDirectTextWidthF(hint, TftFont::Small);
     graphics::tftDirectTextF((W - hw) / 2, cy + 8, hint, LABEL, C_BLACK, TftFont::Small);
 }
+
+#endif // SPECTRUM_DIRECT
+
+void SpectrumModule::notePeak(int8_t dbm, uint32_t hz)
+{
+    const uint32_t now = millis();
+    if (dbm > recentPeakDbm || now - recentPeakMs > 3000) { // hold a peak for 3 s, then let it decay
+        recentPeakDbm = dbm;
+        recentPeakHz = hz;
+        recentPeakMs = now;
+    }
+}
+
+void SpectrumModule::framesChanged()
+{
+#if !SPECTRUM_DIRECT
+    // Add (or drop) our frame and jump to it
+    if (isActive())
+        requestFocus();
+    UIFrameEvent e;
+    e.action = UIFrameEvent::Action::REGENERATE_FRAMESET;
+    notifyObservers(&e);
+#endif
+}
+
+void SpectrumModule::requestRedraw()
+{
+#if !SPECTRUM_DIRECT
+    const uint32_t now = millis();
+    if (now - lastRedrawMs < 100) // the OLED cannot show more than ~10 fps of this usefully
+        return;
+    lastRedrawMs = now;
+    UIFrameEvent e;
+    e.action = UIFrameEvent::Action::REDRAW_ONLY;
+    notifyObservers(&e);
+#endif
+}
+
+void SpectrumModule::nextPeak()
+{
+    // Next local maximum to the right of the cursor that stands well above the floor; wraps.
+    // With nothing strong in the span, go to the strongest bin.
+    auto level = [&](uint16_t b) { return (int)(smooth ? disp[b] : cur[b]); };
+    for (uint16_t k = 1; k < nBins; k++) {
+        const uint16_t b = (cursorBin + k) % nBins;
+        const int l = level(b);
+        if (l < floorDbm + 8)
+            continue;
+        if ((b == 0 || l >= level(b - 1)) && (b + 1 >= nBins || l >= level(b + 1))) {
+            cursorBin = b;
+            requestRedraw();
+            return;
+        }
+    }
+    uint16_t best = 0;
+    for (uint16_t b = 1; b < nBins; b++)
+        if (level(b) > level(best))
+            best = b;
+    cursorBin = best;
+    requestRedraw();
+}
+
+#if !SPECTRUM_DIRECT
+// 128x64 (or similar) mono layout: cursor readout on top, bars in the middle, peak readout below.
+void SpectrumModule::drawFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y)
+{
+    const int16_t w = display->getWidth(), h = display->getHeight();
+    display->setColor(WHITE);
+    display->setFont(FONT_SMALL);
+    display->setTextAlignment(TEXT_ALIGN_LEFT);
+    char buf[40];
+
+    if (mode == Mode::TestTx) {
+        snprintf(buf, sizeof(buf), "Test TX %d dBm", testDbm);
+        display->drawString(x, y, buf);
+        snprintf(buf, sizeof(buf), "Sent %u / %u", testSent, TEST_PACKETS);
+        display->setTextAlignment(TEXT_ALIGN_CENTER);
+        display->drawString(x + w / 2, y + h / 2 - FONT_HEIGHT_SMALL / 2, buf);
+        return;
+    }
+    if (calibrationLeft) {
+        display->setTextAlignment(TEXT_ALIGN_CENTER);
+        display->drawString(x + w / 2, y + h / 2 - FONT_HEIGHT_SMALL, "Setting noise floor");
+        display->drawString(x + w / 2, y + h / 2, "keep transmitters quiet");
+        return;
+    }
+
+    // Cursor readout
+    const uint32_t hz = binHz(cursorBin);
+    snprintf(buf, sizeof(buf), "%lu.%03lu  %d dBm", (unsigned long)(hz / 1000000UL), (unsigned long)((hz / 1000UL) % 1000UL),
+             smooth ? disp[cursorBin] : cur[cursorBin]);
+    display->drawString(x, y, buf);
+
+    // Bars: one pixel column per bin when zoomed, the strongest bin per column on the full band
+    const int16_t top = y + FONT_HEIGHT_SMALL + 1;
+    const int16_t bottom = y + h - FONT_HEIGHT_SMALL - 1;
+    for (int16_t px = 0; px < w; px++) {
+        uint16_t b0 = (uint16_t)((int32_t)px * nBins / w);
+        uint16_t b1 = (uint16_t)((int32_t)(px + 1) * nBins / w);
+        if (b1 <= b0)
+            b1 = b0 + 1;
+        int lvl = -128, pk = -128;
+        bool cursorHere = false;
+        for (uint16_t b = b0; b < b1 && b < nBins; b++) {
+            const int l = smooth ? disp[b] : cur[b];
+            if (l > lvl)
+                lvl = l;
+            if (peak[b] > pk)
+                pk = peak[b];
+            cursorHere |= (b == cursorBin);
+        }
+        const int16_t yy = dbmY(lvl, top, bottom);
+        if (bottom > yy)
+            display->drawVerticalLine(x + px, yy, bottom - yy);
+        if (peakHold && pk > lvl)
+            display->setPixel(x + px, dbmY(pk, top, bottom));
+        if (cursorHere) // cursor: a dotted line from the top of the plot down to the bar
+            for (int16_t cy = top; cy < yy; cy += 3)
+                display->setPixel(x + px, cy);
+    }
+    for (int16_t px = 0; px < w; px += 4) // noise floor, dotted
+        display->setPixel(x + px, dbmY(floorDbm, top, bottom));
+
+    // Peak readout: the strongest thing seen in the last few seconds
+    if (recentPeakHz)
+        snprintf(buf, sizeof(buf), "Pk %d dBm %lu.%03lu", recentPeakDbm, (unsigned long)(recentPeakHz / 1000000UL),
+                 (unsigned long)((recentPeakHz / 1000UL) % 1000UL));
+    else
+        snprintf(buf, sizeof(buf), "Pk --");
+    display->drawString(x, y + h - FONT_HEIGHT_SMALL, buf);
+}
+#endif
 
 #endif
