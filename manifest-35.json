@@ -1,0 +1,16 @@
+{
+  "name": "Meshtastic CYD 3.5\" (ST7796)",
+  "version": "2.8.1.267074e",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        {
+          "path": "bins/firmware-lcdwiki_3_5_e22-2.8.1.267074e.factory.bin",
+          "offset": 0
+        }
+      ]
+    }
+  ]
+}

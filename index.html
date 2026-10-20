@@ -35,7 +35,7 @@
 <body>
 <main>
   <h1>Meshtastic CYD — Web Flasher</h1>
-  <p class="sub">Flash the LCDWIKI 2.8" ESP32 + E22 build straight from your browser.
+  <p class="sub">Flash the LCDWIKI CYD + E22 builds (and a Heltec V3 spectrum build) straight from your browser.
      Use <b>Chrome</b> or <b>Edge</b> on desktop — Web Serial isn't available in Firefox or Safari.</p>
 
   <div class="card">
@@ -52,6 +52,19 @@
     <p class="note">Built but not yet verified on hardware — if it misbehaves, try the ST7789 build.</p>
   </div>
 
+  <div class="card">
+    <h2>LCDWIKI 3.5" (ST7796)</h2>
+    <p>The 480×320 LCDWIKI 3.5" ESP32-32E with an E22 on the same wiring scheme. Tested on hardware.</p>
+    <esp-web-install-button manifest="manifest-35.json"></esp-web-install-button>
+  </div>
+
+  <div class="card">
+    <h2>Heltec V3 + spectrum analyzer</h2>
+    <p>Stock Heltec WiFi LoRa 32 V3 with the on-device spectrum analyzer (LoRa Actions → Spectrum)
+       and Radio Tuning added. Its bare SX1262 reads close to true dBm, so it makes a good measuring receiver.</p>
+    <esp-web-install-button manifest="manifest-heltec-v3.json"></esp-web-install-button>
+  </div>
+
   <div class="card warn">
     <p><b>Installing erases the device.</b> Wi-Fi credentials, node name and channels are wiped;
        reconfigure from the Meshtastic phone app over Bluetooth after flashing. Maps live on the
@@ -59,7 +72,7 @@
   </div>
 
   <footer>
-    Version 2.8.1.1aae089 · fork of <a href="https://github.com/meshtastic/firmware">meshtastic/firmware</a> ·
+    Version 2.8.1.267074e · fork of <a href="https://github.com/meshtastic/firmware">meshtastic/firmware</a> ·
     not an official Meshtastic project.<br>
     Prefer the command line? See the <a href="README.md">README</a> for esptool instructions.
   </footer>

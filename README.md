@@ -15,8 +15,8 @@ street names, and battery sensing.
 > [meshtastic/firmware](https://github.com/meshtastic/firmware).
 >
 > This branch holds only the ready-to-flash builds and the map generator. The
-> **full firmware source is on the [`lcdwiki-2.8-e22`](../../tree/lcdwiki-2.8-e22)
-> branch**, which is the Meshtastic tree with this board's variant added.
+> **full firmware source is on the [`lcdwiki-2.8.1`](../../tree/lcdwiki-2.8.1)
+> branch**, which is the Meshtastic tree with these boards' variants added.
 
 ## Flash it
 
@@ -30,7 +30,8 @@ Or use `esptool` from the command line, below.
 
 | Version | Built from |
 |---|---|
-| `2.8.1.1aae089` | Meshtastic 2.8.1 + this fork. Current. |
+| `2.8.1.267074e` | Current. Adds the LCDWIKI 3.5" and a Heltec V3 build, on-device Quick Settings, Node Details, traceroute on the map, a spectrum analyzer + test transmitter (LoRa Actions → Spectrum), Radio Tuning, and upstream SX126x radio fixes. |
+| `2.8.1.1aae089` | Meshtastic 2.8.1 + this fork. |
 | `2.8.0.21d15f6` | previous release, kept for rollback |
 
 The ILI9341 `2.8.1` image is **built but not yet verified on hardware** - if the screen
@@ -44,12 +45,14 @@ image gives a garbled, mirrored or blank screen.
 |---|---|
 | ILI9341 | `bins/firmware-lcdwiki_2_8_e22-*.factory.bin` |
 | ST7789 | `bins/firmware-lcdwiki_2_8_e22_st7789-*.factory.bin` |
+| LCDWIKI 3.5" (ST7796) | `bins/firmware-lcdwiki_3_5_e22-*.factory.bin` |
+| Heltec V3 (ESP32-S3) | `bins/firmware-heltec-v3-spectrum-*.factory.bin` — flash with `--chip esp32s3 --flash-size 8MB` |
 
 ```bash
 pip install esptool
 esptool --chip esp32 --port COM3 --baud 460800 write-flash \
   --flash-mode dio --flash-freq 40m --flash-size 4MB \
-  0x0 bins/firmware-lcdwiki_2_8_e22_st7789-2.8.1.1aae089.factory.bin
+  0x0 bins/firmware-lcdwiki_2_8_e22_st7789-2.8.1.267074e.factory.bin
 ```
 
 Write it at `0x0`: these are complete images including the bootloader and
@@ -142,9 +145,10 @@ Known rough edges:
 ## Licence
 
 GPL-3.0, inherited from Meshtastic — see [LICENSE](LICENSE). The binaries here
-were built from commit `21d15f6` on the
-[`lcdwiki-2.8-e22`](../../tree/lcdwiki-2.8-e22) branch of this repository, which
-is the corresponding source.
+were built from commit `267074e` on the
+[`lcdwiki-2.8.1`](../../tree/lcdwiki-2.8.1) branch of this repository, which
+is the corresponding source (older images: `1aae089` on `lcdwiki-2.8.1`,
+`21d15f6` on `lcdwiki-2.8-e22`).
 
 Map data from [OpenStreetMap](https://www.openstreetmap.org/copyright),
 © OpenStreetMap contributors, ODbL.

@@ -1,0 +1,16 @@
+{
+  "name": "Meshtastic Heltec V3 + Spectrum",
+  "version": "2.8.1.267074e",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        {
+          "path": "bins/firmware-heltec-v3-spectrum-2.8.1.267074e.factory.bin",
+          "offset": 0
+        }
+      ]
+    }
+  ]
+}

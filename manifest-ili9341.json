@@ -1,12 +1,15 @@
 {
   "name": "Meshtastic CYD 2.8\" (ILI9341)",
-  "version": "2.8.1.1aae089",
+  "version": "2.8.1.267074e",
   "new_install_prompt_erase": true,
   "builds": [
     {
       "chipFamily": "ESP32",
       "parts": [
-        { "path": "bins/firmware-lcdwiki_2_8_e22-2.8.1.1aae089.factory.bin", "offset": 0 }
+        {
+          "path": "bins/firmware-lcdwiki_2_8_e22-2.8.1.267074e.factory.bin",
+          "offset": 0
+        }
       ]
     }
   ]
