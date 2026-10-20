@@ -11,6 +11,9 @@
 #endif
 #include <cmath>
 #include <cstring>
+#if defined(ARCH_ESP32)
+#include <esp_heap_caps.h>
+#endif
 
 #if defined(HAS_SDCARD) && !defined(SDCARD_USE_SOFT_SPI)
 #include "SPILock.h"
@@ -53,12 +56,15 @@ constexpr uint8_t kNameMax = 48; // matches NAME_MAX_BYTES in prepare_basemap.py
 
 struct LabelCand {
     // v2 stores an offset into the one global blob; v3 an absolute file offset, because
-    // each section has its own blob and the candidate outlives the section read.
+    // each section has its own blob and the candidate outlives the section read. v4: an
+    // arena offset when src is kSrcArena, else a file offset in pack `src`.
     uint32_t nameId;
     int16_t x, y;   // anchor: midpoint of the longest visible segment, so it is on the road
     uint16_t run;   // total visible length in px, which is what earns the label
     uint8_t layer;
+    uint8_t src;
 };
+constexpr uint8_t kSrcArena = 0xFF;
 constexpr uint8_t kMaxCands = 24;
 LabelCand cands[kMaxCands];
 uint8_t nCands = 0;
@@ -281,15 +287,20 @@ struct Entry {
 // this way the longest hold is one 1 KB window, and interleaving is safe because file
 // position lives in the filesystem layer, not on the card.
 
-File openMap()
+File openPath(const char *path)
 {
 #if defined(BASEMAP_CAN_USE_SD)
     if (useSd) {
         concurrency::LockGuard g(spiLock);
-        return SD.open(kPath, FILE_O_READ);
+        return SD.open(path, FILE_O_READ);
     }
 #endif
-    return FSCom.open(kPath, FILE_O_READ);
+    return FSCom.open(path, FILE_O_READ);
+}
+
+File openMap()
+{
+    return openPath(kPath);
 }
 
 size_t mapRead(File &f, void *dst, size_t n)
@@ -423,10 +434,479 @@ void drawSection(OLEDDisplay *display, File &f, const Entry &e, const BaseMap::T
             if (totalRun > 0xFFFF)
                 totalRun = 0xFFFF;
             const uint32_t nameRef = (formatVer >= kFormatV3) ? (sectionNameBase + nameId) : (uint32_t)nameId;
-            cands[nCands++] = {nameRef, (int16_t)bestX, (int16_t)bestY, (uint16_t)totalRun, layer};
+            cands[nCands++] = {nameRef, (int16_t)bestX, (int16_t)bestY, (uint16_t)totalRun, layer, 0};
         }
     }
 }
+
+
+// =======================================================================================
+// v4 map packs: /maps/*.map
+//
+// Each pack covers one area and is cut into tiles on a fixed global lat/lon grid at three
+// detail levels, so packs for neighbouring areas meet seamlessly and adding an area is
+// dropping another file in /maps. The level is picked by zoom, so a wide view draws a
+// pre-simplified map instead of every street. Points are i16, tile-relative.
+//
+//   header (48 B): "MAP4", u8 version, u8 nLevels, u8 shift[3] (tile = 2^-shift degrees),
+//                  pad, i32 minLat/minLon/maxLat/maxLon (1e-7 deg), u32 tileCount, u32 dirOff
+//   directory:     tileCount x {u32 key, u32 off, u32 len}, sorted by key
+//                  key = level << 28 | iy << 14 | ix,  ix = floor((lon+180)*2^shift)
+//   tile:          u16 nameLen, names (u8 len + bytes), u16 wayCount,
+//                  ways: u8 layer, u16 npts, u16 nameId, npts x (i16 x, i16 y),
+//                  u16 poiCount (reserved, 0)
+//                  x/y: 0..16384 across the tile, west->east and south->north
+//
+// Tiles in view are kept in one RAM arena while Bluetooth and Wi-Fi are off (that is the
+// only time the SD card is mounted anyway, and there is ~98 KB free then). It is allocated
+// once, the first time the map needs it, and kept for the session: allocating and freeing
+// a block this size on every visit would fragment the heap. It is released only if free
+// heap runs low, and without it tiles stream off the card through the 1 KB window.
+// =======================================================================================
+namespace v4
+{
+constexpr uint8_t kVersion = 4;
+constexpr uint8_t kLevels = 3;
+constexpr int32_t kTileUnits = 16384;
+constexpr uint8_t kMaxPacks = 6;
+constexpr uint8_t kPathMax = 40;
+constexpr uint8_t kMaxNeed = 24;   // tiles drawn per frame; a wider view keeps the first 24
+constexpr uint8_t kMaxSlots = 24;  // tiles held in the arena
+constexpr uint8_t kRowsMax = 12;   // tile rows searched per pack per view
+constexpr uint32_t kReleaseBelow = 20 * 1024; // give the arena back below this much free heap
+constexpr uint32_t kRetryMs = 60000;
+
+struct Pack {
+    char path[kPathMax];
+    int32_t minLat, minLon, maxLat, maxLon;
+    uint32_t count, dirOff;
+    uint8_t shift[kLevels];
+};
+Pack packs[kMaxPacks];
+uint8_t nPacks = 0;
+
+struct Need {
+    uint32_t key, off, len;
+    uint8_t pack;
+    int8_t slot; // arena slot, or -1 to stream from the card
+};
+Need need[kMaxNeed];
+uint8_t nNeed = 0;
+uint32_t needSig = 0;
+
+struct Slot {
+    uint32_t key;
+    uint32_t at, len;
+    uint32_t lastUse;
+    uint8_t pack;
+};
+uint8_t *arena = nullptr;
+uint32_t arenaSize = 0;
+Slot slots[kMaxSlots];
+uint8_t nSlots = 0;
+uint32_t useTick = 0;
+uint32_t lastAllocTryMs = 0;
+bool allocTried = false;
+
+uint8_t level = 0;
+double viewLat = 0, viewLon = 0;
+double mPerDegLonView = 0;
+
+inline uint32_t makeKey(uint8_t lvl, uint32_t iy, uint32_t ix)
+{
+    return ((uint32_t)lvl << 28) | (iy << 14) | ix;
+}
+
+bool readHeader(const char *path, Pack &pk)
+{
+    File f = openPath(path);
+    if (!f)
+        return false;
+    uint8_t h[48];
+    const bool got = mapRead(f, h, sizeof(h)) == sizeof(h);
+    mapClose(f);
+    if (!got || memcmp(h, "MAP4", 4) != 0 || h[4] != kVersion || h[5] != kLevels)
+        return false;
+    for (uint8_t i = 0; i < kLevels; i++)
+        pk.shift[i] = h[6 + i];
+    pk.minLat = (int32_t)rd32(h + 12);
+    pk.minLon = (int32_t)rd32(h + 16);
+    pk.maxLat = (int32_t)rd32(h + 20);
+    pk.maxLon = (int32_t)rd32(h + 24);
+    pk.count = rd32(h + 28);
+    pk.dirOff = rd32(h + 32);
+    strncpy(pk.path, path, kPathMax - 1);
+    pk.path[kPathMax - 1] = '\0';
+    return pk.count > 0;
+}
+
+/// Find every *.map in /maps. Only the headers are read; directories stay on the card.
+void scan()
+{
+    nPacks = 0;
+    File dir = openPath("/maps");
+    if (!dir)
+        return;
+    if (!dir.isDirectory()) {
+        mapClose(dir);
+        return;
+    }
+    while (nPacks < kMaxPacks) {
+        File e;
+        {
+#if defined(BASEMAP_CAN_USE_SD)
+            if (useSd) {
+                concurrency::LockGuard g(spiLock);
+                e = dir.openNextFile();
+            } else
+#endif
+                e = dir.openNextFile();
+        }
+        if (!e)
+            break;
+        char path[kPathMax];
+        const char *nm = e.name();
+        const char *base = strrchr(nm, '/');
+        base = base ? base + 1 : nm;
+        const bool isDir = e.isDirectory();
+        mapClose(e);
+        const size_t n = strlen(base);
+        if (isDir || n < 5 || strcasecmp(base + n - 4, ".map") != 0 || n + 7 >= kPathMax)
+            continue;
+        snprintf(path, sizeof(path), "/maps/%s", base);
+        Pack &pk = packs[nPacks];
+        if (readHeader(path, pk)) {
+            LOG_INFO("BaseMap: pack %s, %u tiles, %.4f,%.4f .. %.4f,%.4f", path, pk.count, pk.minLat * 1e-7,
+                     pk.minLon * 1e-7, pk.maxLat * 1e-7, pk.maxLon * 1e-7);
+            nPacks++;
+        } else {
+            LOG_WARN("BaseMap: %s is not a v4 map pack, skipped", path);
+        }
+    }
+    mapClose(dir);
+}
+
+/// First directory index whose key is >= want (binary search over the card).
+uint32_t lowerBound(File &f, const Pack &pk, uint32_t want)
+{
+    uint32_t lo = 0, hi = pk.count;
+    uint8_t b[4];
+    while (lo < hi) {
+        const uint32_t mid = (lo + hi) / 2;
+        if (!mapSeek(f, pk.dirOff + mid * 12) || mapRead(f, b, 4) != 4)
+            return pk.count;
+        if (rd32(b) < want)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+// --- arena -----------------------------------------------------------------------------
+
+bool cacheAllowed()
+{
+    return !config.bluetooth.enabled && !config.network.wifi_enabled;
+}
+
+void releaseArena(const char *why)
+{
+    if (!arena)
+        return;
+    free(arena);
+    arena = nullptr;
+    arenaSize = 0;
+    nSlots = 0;
+    for (uint8_t i = 0; i < nNeed; i++)
+        need[i].slot = -1;
+    LOG_INFO("BaseMap: tile cache released (%s)", why);
+}
+
+void ensureArena()
+{
+#if defined(ARCH_ESP32)
+    if (arena) {
+        if (ESP.getFreeHeap() < kReleaseBelow)
+            releaseArena("low heap");
+        return;
+    }
+    if (!cacheAllowed())
+        return;
+    if (allocTried && millis() - lastAllocTryMs < kRetryMs)
+        return;
+    allocTried = true;
+    lastAllocTryMs = millis();
+    static const uint32_t sizes[] = {32 * 1024, 24 * 1024, 16 * 1024};
+    const uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    const uint32_t freeNow = ESP.getFreeHeap();
+    for (uint32_t sz : sizes) {
+        // Leave a real margin: the block must not be the last big one, and the rest of
+        // the firmware keeps at least 40 KB.
+        if (largest < sz + 8 * 1024 || freeNow < sz + 40 * 1024)
+            continue;
+        arena = (uint8_t *)malloc(sz);
+        if (arena) {
+            arenaSize = sz;
+            nSlots = 0;
+            LOG_INFO("BaseMap: tile cache %u KB (free %u, largest %u)", sz / 1024, freeNow, largest);
+            return;
+        }
+    }
+    LOG_INFO("BaseMap: no room for a tile cache (free %u, largest %u), streaming from the card", freeNow, largest);
+#endif
+}
+
+int8_t findSlot(uint8_t pack, uint32_t key)
+{
+    for (uint8_t i = 0; i < nSlots; i++)
+        if (slots[i].key == key && slots[i].pack == pack)
+            return (int8_t)i;
+    return -1;
+}
+
+void removeSlot(uint8_t i)
+{
+    for (uint8_t j = i; j + 1 < nSlots; j++)
+        slots[j] = slots[j + 1];
+    nSlots--;
+}
+
+/// Close the gaps left by evicted tiles so the free space is one block at the end.
+uint32_t compact()
+{
+    // Selection by address, then slide each tile down. Slots are few (<= 24).
+    for (uint8_t i = 0; i < nSlots; i++)
+        for (uint8_t j = i + 1; j < nSlots; j++)
+            if (slots[j].at < slots[i].at) {
+                const Slot t = slots[i];
+                slots[i] = slots[j];
+                slots[j] = t;
+            }
+    uint32_t end = 0;
+    for (uint8_t i = 0; i < nSlots; i++) {
+        if (slots[i].at != end)
+            memmove(arena + end, arena + slots[i].at, slots[i].len);
+        slots[i].at = end;
+        end += slots[i].len;
+    }
+    return end;
+}
+
+/// Make the arena hold as many of this frame's tiles as fit, keeping anything already
+/// there that is still in view and evicting the least recently used of the rest.
+void fillArena()
+{
+    ensureArena();
+    for (uint8_t i = 0; i < nNeed; i++)
+        need[i].slot = -1;
+    if (!arena)
+        return;
+
+    useTick++;
+    uint32_t missing = 0;
+    for (uint8_t i = 0; i < nNeed; i++) {
+        const int8_t s = findSlot(need[i].pack, need[i].key);
+        if (s >= 0)
+            slots[s].lastUse = useTick;
+        else if (need[i].len <= arenaSize)
+            missing += need[i].len;
+    }
+    uint32_t used = 0;
+    for (uint8_t i = 0; i < nSlots; i++)
+        used += slots[i].len;
+    // Evict tiles not in view, oldest first, until the missing ones fit.
+    while (used + missing > arenaSize) {
+        int8_t victim = -1;
+        for (uint8_t i = 0; i < nSlots; i++)
+            if (slots[i].lastUse != useTick && (victim < 0 || slots[i].lastUse < slots[victim].lastUse))
+                victim = (int8_t)i;
+        if (victim < 0)
+            break;
+        used -= slots[victim].len;
+        removeSlot((uint8_t)victim);
+    }
+    uint32_t end = compact();
+
+    File f;
+    uint8_t openPack = 0xFF;
+    for (uint8_t i = 0; i < nNeed; i++) {
+        Need &n = need[i];
+        int8_t s = findSlot(n.pack, n.key);
+        if (s < 0 && nSlots < kMaxSlots && end + n.len <= arenaSize) {
+            if (openPack != n.pack) {
+                if (f)
+                    mapClose(f);
+                f = openPath(packs[n.pack].path);
+                openPack = n.pack;
+            }
+            if (!f || !mapSeek(f, n.off))
+                continue;
+            // Read in modest chunks so the SPI lock (shared with the radio) is never held
+            // for a whole tile.
+            uint32_t got = 0;
+            while (got < n.len) {
+                const uint32_t chunk = (n.len - got) < 2048 ? (n.len - got) : 2048;
+                if (mapRead(f, arena + end + got, chunk) != chunk)
+                    break;
+                got += chunk;
+            }
+            if (got != n.len)
+                continue;
+            slots[nSlots] = {n.key, end, n.len, useTick, n.pack};
+            s = (int8_t)nSlots++;
+            end += n.len;
+        }
+        n.slot = s;
+    }
+    if (f)
+        mapClose(f);
+}
+
+// --- tile parsing ----------------------------------------------------------------------
+
+/// A tile read straight out of the arena.
+struct MemSrc {
+    const uint8_t *p;
+    uint32_t left;
+    uint32_t pos; // arena offset of p, for name references
+    bool read(void *dst, uint32_t n)
+    {
+        if (n > left)
+            return false;
+        memcpy(dst, p, n);
+        p += n;
+        pos += n;
+        left -= n;
+        return true;
+    }
+    bool skip(uint32_t n)
+    {
+        if (n > left)
+            return false;
+        p += n;
+        pos += n;
+        left -= n;
+        return true;
+    }
+    /// Points: hand back a pointer into the arena, no copy.
+    const uint8_t *points(uint32_t n)
+    {
+        if (n > left)
+            return nullptr;
+        const uint8_t *r = p;
+        p += n;
+        pos += n;
+        left -= n;
+        return r;
+    }
+};
+
+/// A tile streamed off the card through the 1 KB window.
+struct FileSrc {
+    File &f;
+    uint32_t pos; // file offset, for name references
+    bool read(void *dst, uint32_t n)
+    {
+        if (mapRead(f, dst, n) != n)
+            return false;
+        pos += n;
+        return true;
+    }
+    bool skip(uint32_t n)
+    {
+        if (!mapSeek(f, pos + n))
+            return false;
+        pos += n;
+        return true;
+    }
+    const uint8_t *points(uint32_t n)
+    {
+        if (n > kWindow || mapRead(f, win, n) != n)
+            return nullptr;
+        pos += n;
+        return win;
+    }
+};
+
+template <class Src>
+void drawTile(OLEDDisplay *display, Src &src, uint8_t srcId, uint32_t key, uint8_t shift, const BaseMap::Transform &t, bool drawLocal,
+              float inv)
+{
+    const uint32_t ix = key & 0x3FFF, iy = (key >> 14) & 0x3FFF;
+    const double span = 1.0 / (double)(1u << shift);
+    const double lon0 = (double)ix * span - 180.0, lat0 = (double)iy * span - 90.0;
+    // Tile units -> screen pixels, as one multiply-add per axis.
+    const float baseE = (float)((lon0 - viewLon) * mPerDegLonView) - t.panEastM;
+    const float baseN = (float)((lat0 - viewLat) * kMPerDegLat) - t.panNorthM;
+    const float ax = t.cx + baseE * inv, ay = t.cy - baseN * inv;
+    const float kx = (float)(span * mPerDegLonView / kTileUnits) * inv;
+    const float ky = (float)(span * kMPerDegLat / kTileUnits) * inv;
+
+    uint8_t b2[2];
+    if (!src.read(b2, 2))
+        return;
+    const uint32_t nameBase = src.pos;
+    if (!src.skip(rd16(b2)) || !src.read(b2, 2))
+        return;
+    const uint16_t nWays = rd16(b2);
+
+    for (uint16_t w = 0; w < nWays; w++) {
+        uint8_t wh[5];
+        if (!src.read(wh, 5))
+            return;
+        const uint8_t layer = wh[0];
+        const uint16_t npts = rd16(wh + 1);
+        const uint16_t nameId = rd16(wh + 3);
+        if (npts == 0)
+            continue;
+        if (layer == 3 && !drawLocal) {
+            if (!src.skip((uint32_t)npts * 4))
+                return;
+            continue;
+        }
+        const bool wantName = (nameId != kNameNone && layer != 0 && nCands < kMaxCands);
+        int32_t totalRun = 0, bestSeg = 0, bestX = 0, bestY = 0;
+        int32_t px = 0, py = 0;
+        bool first = true;
+        uint16_t remaining = npts;
+        while (remaining) {
+            const uint16_t perRead = (uint16_t)(kWindow / 4);
+            const uint16_t chunk = remaining < perRead ? remaining : perRead;
+            const uint8_t *pts = src.points((uint32_t)chunk * 4);
+            if (!pts)
+                return;
+            for (uint16_t i = 0; i < chunk; i++) {
+                const int32_t sx = (int32_t)lroundf(ax + (float)rdi16(pts + i * 4) * kx);
+                const int32_t sy = (int32_t)lroundf(ay - (float)rdi16(pts + i * 4 + 2) * ky);
+                if (!first) {
+                    int32_t mx = 0, my = 0;
+                    const int32_t drawn = drawSeg(display, px, py, sx, sy, layer, t, &mx, &my);
+                    if (wantName && drawn > bestSeg) {
+                        bestSeg = drawn;
+                        bestX = mx;
+                        bestY = my;
+                    }
+                    if (wantName && drawn > 0)
+                        totalRun += drawn;
+                }
+                px = sx;
+                py = sy;
+                first = false;
+            }
+            remaining -= chunk;
+        }
+        if (wantName && bestSeg > 0) {
+            if (totalRun > 0xFFFF)
+                totalRun = 0xFFFF;
+            cands[nCands++] = {nameBase + nameId, (int16_t)bestX, (int16_t)bestY, (uint16_t)totalRun, layer, srcId};
+        }
+    }
+}
+
+} // namespace v4
+
+bool usePacks = false;
 
 } // namespace
 
@@ -464,9 +944,32 @@ bool BaseMap::begin()
     }
 #endif
 
+    // v4 packs in /maps take precedence over the single legacy file.
+    {
+#if defined(BASEMAP_CAN_USE_SD)
+        const bool sdWas = useSd;
+        bool sdPresent = false;
+        {
+            concurrency::LockGuard g(spiLock);
+            sdPresent = (SD.cardType() != CARD_NONE);
+        }
+        useSd = sdPresent;
+#endif
+        v4::scan();
+        if (v4::nPacks > 0) {
+            usePacks = true;
+            ok = true;
+            LOG_INFO("BaseMap: %u map pack(s) in /maps", v4::nPacks);
+            return true;
+        }
+#if defined(BASEMAP_CAN_USE_SD)
+        useSd = sdWas;
+#endif
+    }
+
     auto f = openMap();
     if (!f) {
-        LOG_INFO("BaseMap: no %s on SD or internal flash, map frame will show nodes only", kPath);
+        LOG_INFO("BaseMap: no /maps packs or %s on SD or internal flash, map frame will show nodes only", kPath);
         return false;
     }
 
@@ -537,7 +1040,7 @@ void BaseMap::reserve(int16_t x, int16_t y, int16_t w, int16_t h)
 void BaseMap::drawLabels(OLEDDisplay *display, const Transform &t)
 {
     // nameLen is only meaningful for v2; v3 keeps names per section and leaves it zero.
-    if (!ok || nCands == 0 || (formatVer < kFormatV3 && nameLen == 0) || t.mPerPx > kLabelZoomMPerPx)
+    if (!ok || nCands == 0 || (!usePacks && formatVer < kFormatV3 && nameLen == 0) || t.mPerPx > kLabelZoomMPerPx)
         return;
 
     // Rank: major roads first, then by how much of the road is on screen. Selection sort -
@@ -566,14 +1069,18 @@ void BaseMap::drawLabels(OLEDDisplay *display, const Transform &t)
         return false;
     };
 
-    auto f = openMap();
-    if (!f)
-        return;
+    File f;
+    uint8_t openPack = 0xFE;
+    if (!usePacks) {
+        f = openMap();
+        if (!f)
+            return;
+    }
 
     display->setFont(FONT_SMALL);
     display->setTextAlignment(TEXT_ALIGN_LEFT);
 
-    uint16_t placedIds[kLabelsMax];
+    uint32_t placedIds[kLabelsMax]; // hash of the name text: one street spans many tiles
     int16_t placedX[kLabelsMax], placedY[kLabelsMax];
     uint8_t placed = 0;
     char name[kNameMax];
@@ -585,26 +1092,46 @@ void BaseMap::drawLabels(OLEDDisplay *display, const Transform &t)
         if (c.layer == 2 && t.mPerPx > kMinorZoomMPerPx)
             continue;
 
+        uint8_t len = 0;
+        if (usePacks && c.src == kSrcArena) {
+            if (!v4::arena || c.nameId >= v4::arenaSize)
+                continue;
+            len = v4::arena[c.nameId];
+            if (len == 0 || len >= kNameMax || c.nameId + 1 + len > v4::arenaSize)
+                continue;
+            memcpy(name, v4::arena + c.nameId + 1, len);
+        } else {
+            if (usePacks && c.src != openPack) {
+                if (f)
+                    mapClose(f);
+                f = openPath(v4::packs[c.src].path);
+                openPack = c.src;
+            }
+            if (!f)
+                continue;
+            // v2: offset into the one global blob. v3/v4: already an absolute file offset,
+            // since the name lives in its own section's blob.
+            const uint32_t at = (usePacks || formatVer >= kFormatV3) ? c.nameId : (nameOff + c.nameId);
+            if (!mapSeek(f, at))
+                break;
+            if (mapRead(f, &len, 1) != 1 || len == 0 || len >= kNameMax)
+                continue;
+            if (mapRead(f, name, len) != len)
+                continue;
+        }
+        name[len] = '\0';
+
         // Same name already on screen nearby - one "Edgewood Road" is enough.
+        uint32_t h = 2166136261u;
+        for (uint8_t k = 0; k < len; k++)
+            h = (h ^ (uint8_t)name[k]) * 16777619u;
         bool dupe = false;
         for (uint8_t p = 0; p < placed && !dupe; p++) {
             const int32_t dx = placedX[p] - c.x, dy = placedY[p] - c.y;
-            dupe = (placedIds[p] == c.nameId) && (dx * dx + dy * dy < kDedupePx * kDedupePx);
+            dupe = (placedIds[p] == h) && (dx * dx + dy * dy < kDedupePx * kDedupePx);
         }
         if (dupe)
             continue;
-
-        // v2: offset into the one global blob. v3: already an absolute file offset, since
-        // the name lives in its own section's blob.
-        const uint32_t at = (formatVer >= kFormatV3) ? c.nameId : (nameOff + c.nameId);
-        if (!mapSeek(f, at))
-            break;
-        uint8_t len = 0;
-        if (mapRead(f, &len, 1) != 1 || len == 0 || len >= kNameMax)
-            continue;
-        if (mapRead(f, name, len) != len)
-            continue;
-        name[len] = '\0';
 
         const int16_t w = (int16_t)display->getStringWidth(name, len, false);
         if (w <= 0 || (int32_t)c.run < (int32_t)(w * kMinRunFactor))
@@ -642,18 +1169,19 @@ void BaseMap::drawLabels(OLEDDisplay *display, const Transform &t)
         }
 
         reserve(bx, y, bw, FONT_HEIGHT_SMALL);
-        placedIds[placed] = c.nameId;
+        placedIds[placed] = h;
         placedX[placed] = c.x;
         placedY[placed] = c.y;
         placed++;
     }
 
-    mapClose(f);
+    if (f)
+        mapClose(f);
 }
 
 bool BaseMap::usingDetail()
 {
-    return curDetail;
+    return usePacks ? (v4::level == v4::kLevels - 1) : curDetail;
 }
 
 bool BaseMap::bandIsDirect()
@@ -675,6 +1203,12 @@ bool BaseMap::getOrigin(double &lat, double &lon)
 {
     if (!ok)
         return false;
+    if (usePacks) {
+        const v4::Pack &pk = v4::packs[0];
+        lat = ((double)pk.minLat + pk.maxLat) * 0.5e-7;
+        lon = ((double)pk.minLon + pk.maxLon) * 0.5e-7;
+        return true;
+    }
     lat = lat0_i * 1e-7;
     lon = lon0_i * 1e-7;
     return true;
@@ -684,6 +1218,85 @@ void BaseMap::prepare(double viewOriginLat, double viewOriginLon, float mPerPx, 
 {
     if (!ok)
         return;
+
+    if (usePacks) {
+        using namespace v4;
+        curOffsetE = curOffsetN = 0.0f; // tiles are placed from the view origin directly
+        viewLat = viewOriginLat;
+        viewLon = viewOriginLon;
+        mPerDegLonView = 111320.0 * cos(viewOriginLat * M_PI / 180.0);
+        // Detail level by zoom: every street up close, minor roads in the middle, water and
+        // major roads only when a pixel is tens of metres across.
+        level = (mPerPx <= 8.0f) ? 2 : (mPerPx <= 50.0f) ? 1 : 0;
+
+        // The widest panel is 480 px; err wide rather than leave an edge undrawn.
+        const double halfWideM = 240.0 * mPerPx, halfSpanM = halfSpanPx * (double)mPerPx;
+        const double dLat = halfSpanM / kMPerDegLat, dLon = halfWideM / (mPerDegLonView > 1 ? mPerDegLonView : 1);
+        const double s0 = viewOriginLat - dLat, n0 = viewOriginLat + dLat;
+        const double w0 = viewOriginLon - dLon, e0 = viewOriginLon + dLon;
+
+        uint32_t sig = 2166136261u ^ level;
+        struct Range {
+            int32_t ix0, ix1, iy0, iy1;
+        } ranges[kMaxPacks];
+        for (uint8_t p = 0; p < nPacks; p++) {
+            const Pack &pk = packs[p];
+            Range &r = ranges[p];
+            r.ix0 = 1;
+            r.ix1 = 0; // empty
+            const double ps = pk.minLat * 1e-7, pn = pk.maxLat * 1e-7, pw = pk.minLon * 1e-7, pe = pk.maxLon * 1e-7;
+            const double s = s0 > ps ? s0 : ps, n = n0 < pn ? n0 : pn, w = w0 > pw ? w0 : pw, e = e0 < pe ? e0 : pe;
+            if (s > n || w > e)
+                continue;
+            const double scale = (double)(1u << pk.shift[level]);
+            r.ix0 = (int32_t)floor((w + 180.0) * scale);
+            r.ix1 = (int32_t)floor((e + 180.0) * scale);
+            r.iy0 = (int32_t)floor((s + 90.0) * scale);
+            r.iy1 = (int32_t)floor((n + 90.0) * scale);
+            if (r.iy1 - r.iy0 >= kRowsMax)
+                r.iy1 = r.iy0 + kRowsMax - 1;
+            sig = (sig ^ (uint32_t)(p + 1)) * 16777619u;
+            sig = (sig ^ (uint32_t)r.ix0) * 16777619u;
+            sig = (sig ^ (uint32_t)r.ix1) * 16777619u;
+            sig = (sig ^ (uint32_t)r.iy0) * 16777619u;
+            sig = (sig ^ (uint32_t)r.iy1) * 16777619u;
+        }
+
+        // Same tiles as last time: nothing to look up. Panning within a tile, or zooming
+        // inside one detail level, never touches the card.
+        if (sig != needSig || nNeed == 0) {
+            needSig = sig;
+            nNeed = 0;
+            for (uint8_t p = 0; p < nPacks && nNeed < kMaxNeed; p++) {
+                const Range &r = ranges[p];
+                if (r.ix1 < r.ix0)
+                    continue;
+                File f = openPath(packs[p].path);
+                if (!f)
+                    continue;
+                for (int32_t iy = r.iy0; iy <= r.iy1 && nNeed < kMaxNeed; iy++) {
+                    const uint32_t lo = makeKey(level, (uint32_t)iy, (uint32_t)r.ix0);
+                    const uint32_t hi = makeKey(level, (uint32_t)iy, (uint32_t)r.ix1);
+                    uint32_t idx = lowerBound(f, packs[p], lo);
+                    if (idx >= packs[p].count || !mapSeek(f, packs[p].dirOff + idx * 12))
+                        continue;
+                    // Entries for one row are contiguous, so read forward until past ix1.
+                    uint8_t e[12];
+                    while (idx < packs[p].count && nNeed < kMaxNeed && mapRead(f, e, 12) == 12) {
+                        const uint32_t key = rd32(e);
+                        if (key > hi)
+                            break;
+                        need[nNeed++] = {key, rd32(e + 4), rd32(e + 8), p, -1};
+                        idx++;
+                    }
+                }
+                mapClose(f);
+            }
+        }
+        fillArena();
+        curDetail = (level == kLevels - 1);
+        return;
+    }
 
     // Where the file's origin sits relative to where we are now. Same equirectangular
     // form the packer used, so points land exactly where it intended.
@@ -736,12 +1349,41 @@ void BaseMap::draw(OLEDDisplay *display, const Transform &t)
     }
 #endif
 
+    const bool drawLocal = t.mPerPx <= 8.0f;
+    const float inv = 1.0f / t.mPerPx;
+
+    if (usePacks) {
+        File f;
+        uint8_t openPack = 0xFF;
+        for (uint8_t i = 0; i < v4::nNeed; i++) {
+            const v4::Need &n = v4::need[i];
+            const uint8_t shift = v4::packs[n.pack].shift[v4::level];
+            if (n.slot >= 0 && v4::arena) {
+                const v4::Slot &sl = v4::slots[n.slot];
+                v4::MemSrc src{v4::arena + sl.at, sl.len, sl.at};
+                v4::drawTile(display, src, kSrcArena, n.key, shift, t, drawLocal, inv);
+                continue;
+            }
+            if (openPack != n.pack) {
+                if (f)
+                    mapClose(f);
+                f = openPath(v4::packs[n.pack].path);
+                openPack = n.pack;
+            }
+            if (!f || !mapSeek(f, n.off))
+                continue;
+            v4::FileSrc src{f, n.off};
+            v4::drawTile(display, src, n.pack, n.key, shift, t, drawLocal, inv);
+        }
+        if (f)
+            mapClose(f);
+        return;
+    }
+
     auto f = openMap();
     if (!f)
         return;
 
-    const bool drawLocal = t.mPerPx <= 8.0f;
-    const float inv = 1.0f / t.mPerPx;
     Entry e;
 
     if (curDetail) {
