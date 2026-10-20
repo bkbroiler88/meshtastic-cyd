@@ -433,6 +433,9 @@ template <typename T> int16_t SX126xInterface<T>::trySetStandby()
 #ifndef SPECTRUM_SETTLE_US
 #define SPECTRUM_SETTLE_US 1000 // PLL lock + RSSI averaging after SetRx, before GetRssiInst
 #endif
+#ifndef SPECTRUM_STRONG_SETTLE_US
+#define SPECTRUM_STRONG_SETTLE_US 4000 // extra AGC settling before re-reading a strong bin
+#endif
 
 template <typename T> bool SX126xInterface<T>::spectrumBegin()
 {
@@ -447,6 +450,10 @@ template <typename T> bool SX126xInterface<T>::spectrumBegin()
         return false;
     if (lora.setBandwidth(125.0) != RADIOLIB_ERR_NONE) // RX bandwidth = sweep step
         return false;
+    // Boosted RX gain helps weak packets but makes the front end clip early: strong nearby
+    // signals all read the same ~-49 dBm. Power-saving gain trades a little sensitivity for
+    // headroom. programModemParams() (spectrumEnd -> reconfigure) restores the configured mode.
+    lora.setRxBoostedGainMode(false);
     // RadioLib drives RXEN only from its own mode calls; the raw SetRx in spectrumSample() is not
     // one, so select the receive path here or the sweep would measure through an idle switch
     module.setRfSwitchState(Module::MODE_RX);
@@ -473,6 +480,13 @@ template <typename T> int16_t SX126xInterface<T>::spectrumSample(uint32_t hz)
     uint8_t raw = 0;
     if (module.SPIreadStream(RADIOLIB_SX126X_CMD_GET_RSSI_INST, &raw, 1) != RADIOLIB_ERR_NONE)
         return INT16_MIN;
+    if (raw < 2 * 75) { // above -75 dBm: includes the ~-65 dBm first-read clip itself
+        // Strong signal: the AGC is still backing the gain off when the first read is taken, so
+        // that reading clips. Give it time and read again; quiet bins keep the fast path.
+        delayMicroseconds(SPECTRUM_STRONG_SETTLE_US);
+        if (module.SPIreadStream(RADIOLIB_SX126X_CMD_GET_RSSI_INST, &raw, 1) != RADIOLIB_ERR_NONE)
+            return INT16_MIN;
+    }
     return -(int16_t)raw / 2;
 }
 
