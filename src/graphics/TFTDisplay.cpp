@@ -2664,14 +2664,32 @@ void tftDirectFillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t colo
         tft->fillRect(x, y, w, h, color);
 }
 
+void tftDirectBatch(bool begin)
+{
+    if (!tft)
+        return;
+    if (begin)
+        tft->startWrite();
+    else
+        tft->endWrite();
+}
+
 void tftDirectLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color, uint8_t width)
 {
     if (!tft)
         return;
-    if (width <= 1)
-        tft->drawLine(x0, y0, x1, y1, color);
-    else
-        tft->drawWideLine(x0, y0, x1, y1, (float)width, color);
+    tft->drawLine(x0, y0, x1, y1, color);
+    // Thick lines as parallel 1 px lines offset across the line's minor axis. drawWideLine is
+    // anti-aliased and many times slower per pixel, which made every major road the most
+    // expensive thing on the map; at 2-3 px the edge smoothing is not visible anyway.
+    const bool steep = abs(y1 - y0) > abs(x1 - x0);
+    for (uint8_t k = 1; k < width; k++) {
+        const int16_t o = (k & 1) ? (int16_t)((k + 1) / 2) : (int16_t)(-(k / 2));
+        if (steep)
+            tft->drawLine(x0 + o, y0, x1 + o, y1, color);
+        else
+            tft->drawLine(x0, y0 + o, x1, y1 + o, color);
+    }
 }
 
 void tftDirectCircle(int16_t x, int16_t y, int16_t r, uint16_t color, bool filled)
@@ -2757,6 +2775,7 @@ bool tftDirectAvailable()
 }
 void tftDirectFillRect(int16_t, int16_t, int16_t, int16_t, uint16_t) {}
 void tftDirectLine(int16_t, int16_t, int16_t, int16_t, uint16_t, uint8_t) {}
+void tftDirectBatch(bool) {}
 void tftDirectCircle(int16_t, int16_t, int16_t, uint16_t, bool) {}
 void tftDirectText(int16_t, int16_t, const char *, uint16_t, uint16_t) {}
 int16_t tftDirectTextWidth(const char *)

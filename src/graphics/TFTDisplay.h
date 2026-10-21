@@ -130,6 +130,10 @@ void tftReserveDirectRows(int16_t y0, int16_t y1, uint32_t leaseMs = 500);
 void tftReleaseDirectRows();
 
 void tftDirectFillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color);
+/// Hold the panel's SPI transaction open across many direct draws (begin=true), then
+/// release it (begin=false). Nests. Without it every line and fill row pays a full
+/// transaction setup, which dominates a map redraw.
+void tftDirectBatch(bool begin);
 void tftDirectFillRoundRect(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r, uint16_t color);
 void tftDirectFillTriangle(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t x2, int16_t y2, uint16_t color);
 void tftDirectLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color, uint8_t width = 1);

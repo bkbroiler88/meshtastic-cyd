@@ -277,6 +277,7 @@ inline uint8_t layerWidth(uint8_t layer)
 
 /// Set once per frame so the inner loop does not re-test the display type per segment.
 bool directColor = false;
+uint32_t statSegs = 0, statRows = 0; // per redraw, for the timing line in the log
 #endif
 
 int32_t drawSeg(OLEDDisplay *display, int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint8_t layer,
@@ -294,6 +295,7 @@ int32_t drawSeg(OLEDDisplay *display, int32_t x0, int32_t y0, int32_t x1, int32_
 
 #if defined(MESHTASTIC_MAP_DIRECT_COLOR)
     if (directColor) {
+        statSegs++;
         graphics::tftDirectLine((int16_t)x0, (int16_t)y0, (int16_t)x1, (int16_t)y1, layerColor(layer), layerWidth(layer));
         return drawn;
     }
@@ -693,7 +695,7 @@ void ensureArena()
         return;
     allocTried = true;
     lastAllocTryMs = millis();
-    static const uint32_t sizes[] = {32 * 1024, 24 * 1024, 16 * 1024};
+    static const uint32_t sizes[] = {40 * 1024, 32 * 1024, 24 * 1024, 16 * 1024};
     const uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     const uint32_t freeNow = ESP.getFreeHeap();
     for (uint32_t sz : sizes) {
@@ -930,40 +932,88 @@ void fillArea(const uint8_t *data, uint32_t len, uint8_t kind, float ax, float a
     const int32_t y1 = (int32_t)fminf(floorf(maxY - 0.5f), (float)t.bottom);
     const uint16_t col = kind == 0 ? kColFillWater : kind == 1 ? kColFillPark : kColFillWood;
 
+    // Rows are filled in bands. For each band, one pass over every edge picks out the few
+    // that cross it; each row then tests only those. Testing every edge on every row made a
+    // detailed wood cost rows x edges and was most of a redraw.
     constexpr uint8_t kMaxX = 48;
+    constexpr int32_t kBand = 16;
+    constexpr uint8_t kBandEdges = 64;
     int16_t xs[kMaxX];
-    for (int32_t y = y0; y <= y1; y++) {
-        const float yc = (float)y + 0.5f;
-        uint8_t n = 0;
-        for (uint8_t r = 0; r < nr; r++) {
+    struct BandEdge {
+        uint8_t ring;
+        uint16_t idx; // edge from point idx-1 (wrapping) to idx
+    } bandEdges[kBandEdges];
+    auto ptX = [&](const Ring &rg, uint16_t i) { return ax + (float)rdi16(rg.p + i * 4) * kx; };
+    auto ptY = [&](const Ring &rg, uint16_t i) { return ay - (float)rdi16(rg.p + i * 4 + 2) * ky; };
+
+    for (int32_t b0 = y0; b0 <= y1; b0 += kBand) {
+        const int32_t b1 = (b0 + kBand - 1 < y1) ? b0 + kBand - 1 : y1;
+        const float bTop = (float)b0 + 0.5f, bBot = (float)b1 + 0.5f;
+        uint8_t nb = 0;
+        bool overflow = false;
+        for (uint8_t r = 0; r < nr && !overflow; r++) {
             const Ring &rg = rings[r];
-            float px = ax + (float)rdi16(rg.p + (rg.n - 1) * 4) * kx;
-            float py = ay - (float)rdi16(rg.p + (rg.n - 1) * 4 + 2) * ky;
+            float py = ptY(rg, rg.n - 1);
             for (uint16_t i = 0; i < rg.n; i++) {
-                const float cx = ax + (float)rdi16(rg.p + i * 4) * kx;
-                const float cy = ay - (float)rdi16(rg.p + i * 4 + 2) * ky;
-                if (((py <= yc) && (cy > yc)) || ((cy <= yc) && (py > yc))) {
-                    if (n < kMaxX)
-                        xs[n++] = (int16_t)lroundf(px + (yc - py) * (cx - px) / (cy - py));
+                const float cy = ptY(rg, i);
+                const float lo = py < cy ? py : cy, hi = py < cy ? cy : py;
+                if (hi > bTop && lo <= bBot) {
+                    if (nb == kBandEdges) {
+                        overflow = true;
+                        break;
+                    }
+                    bandEdges[nb++] = {r, i};
                 }
-                px = cx;
                 py = cy;
             }
         }
-        for (uint8_t i = 1; i < n; i++) { // insertion sort, n is small
-            const int16_t v = xs[i];
-            int8_t j = (int8_t)i - 1;
-            while (j >= 0 && xs[j] > v) {
-                xs[j + 1] = xs[j];
-                j--;
+
+        for (int32_t y = b0; y <= b1; y++) {
+            const float yc = (float)y + 0.5f;
+            uint8_t n = 0;
+            if (!overflow) {
+                for (uint8_t e = 0; e < nb; e++) {
+                    const Ring &rg = rings[bandEdges[e].ring];
+                    const uint16_t i = bandEdges[e].idx, pi = i ? i - 1 : rg.n - 1;
+                    const float px = ptX(rg, pi), py = ptY(rg, pi), cx = ptX(rg, i), cy = ptY(rg, i);
+                    if (((py <= yc) && (cy > yc)) || ((cy <= yc) && (py > yc))) {
+                        if (n < kMaxX)
+                            xs[n++] = (int16_t)lroundf(px + (yc - py) * (cx - px) / (cy - py));
+                    }
+                }
+            } else {
+                // More edges in this band than the scratch list holds: test them all.
+                for (uint8_t r = 0; r < nr; r++) {
+                    const Ring &rg = rings[r];
+                    float px = ptX(rg, rg.n - 1), py = ptY(rg, rg.n - 1);
+                    for (uint16_t i = 0; i < rg.n; i++) {
+                        const float cx = ptX(rg, i), cy = ptY(rg, i);
+                        if (((py <= yc) && (cy > yc)) || ((cy <= yc) && (py > yc))) {
+                            if (n < kMaxX)
+                                xs[n++] = (int16_t)lroundf(px + (yc - py) * (cx - px) / (cy - py));
+                        }
+                        px = cx;
+                        py = cy;
+                    }
+                }
             }
-            xs[j + 1] = v;
-        }
-        for (uint8_t i = 0; i + 1 < n; i += 2) {
-            const int16_t xa = xs[i] < t.left ? t.left : xs[i];
-            const int16_t xb = xs[i + 1] > t.right ? t.right : xs[i + 1];
-            if (xb > xa)
-                graphics::tftDirectFillRect(xa, (int16_t)y, (int16_t)(xb - xa), 1, col);
+            for (uint8_t i = 1; i < n; i++) { // insertion sort, n is small
+                const int16_t v = xs[i];
+                int8_t j = (int8_t)i - 1;
+                while (j >= 0 && xs[j] > v) {
+                    xs[j + 1] = xs[j];
+                    j--;
+                }
+                xs[j + 1] = v;
+            }
+            for (uint8_t i = 0; i + 1 < n; i += 2) {
+                const int16_t xa = xs[i] < t.left ? t.left : xs[i];
+                const int16_t xb = xs[i + 1] > t.right ? t.right : xs[i + 1];
+                if (xb > xa) {
+                    graphics::tftDirectFillRect(xa, (int16_t)y, (int16_t)(xb - xa), 1, col);
+                    statRows++;
+                }
+            }
         }
     }
 }
@@ -1460,7 +1510,7 @@ void BaseMap::prepare(double viewOriginLat, double viewOriginLon, float mPerPx, 
         mPerDegLonView = 111320.0 * cos(viewOriginLat * M_PI / 180.0);
         // Detail level by zoom: every street up close, minor roads in the middle, water and
         // major roads only when a pixel is tens of metres across.
-        level = (mPerPx <= 8.0f) ? 2 : (mPerPx <= 50.0f) ? 1 : 0;
+        level = (mPerPx <= 8.0f) ? 2 : (mPerPx <= 25.0f) ? 1 : 0;
 
         // The widest panel is 480 px; err wide rather than leave an edge undrawn.
         const double halfWideM = 240.0 * mPerPx, halfSpanM = halfSpanPx * (double)mPerPx;
@@ -1586,6 +1636,13 @@ void BaseMap::draw(OLEDDisplay *display, const Transform &t)
     const float inv = 1.0f / t.mPerPx;
 
     if (usePacks) {
+        const uint32_t t0 = millis();
+        uint8_t fromArena = 0;
+#if defined(MESHTASTIC_MAP_DIRECT_COLOR)
+        statSegs = statRows = 0;
+        if (directColor)
+            graphics::tftDirectBatch(true); // one panel transaction for the whole band
+#endif
         File f;
         uint8_t openPack = 0xFF;
         for (uint8_t i = 0; i < v4::nNeed; i++) {
@@ -1595,6 +1652,7 @@ void BaseMap::draw(OLEDDisplay *display, const Transform &t)
                 const v4::Slot &sl = v4::slots[n.slot];
                 v4::MemSrc src{v4::arena + sl.at, sl.len, sl.at};
                 v4::drawTile(display, src, kSrcArena, n.key, shift, t, drawLocal, inv);
+                fromArena++;
                 continue;
             }
             if (openPack != n.pack) {
@@ -1610,6 +1668,12 @@ void BaseMap::draw(OLEDDisplay *display, const Transform &t)
         }
         if (f)
             mapClose(f);
+#if defined(MESHTASTIC_MAP_DIRECT_COLOR)
+        if (directColor)
+            graphics::tftDirectBatch(false);
+        LOG_DEBUG("BaseMap: L%u %u tiles (%u from RAM), %u segs, %u fill rows, %u ms", v4::level, v4::nNeed, fromArena,
+                  statSegs, statRows, (unsigned)(millis() - t0));
+#endif
         return;
     }
 
