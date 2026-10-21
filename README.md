@@ -30,7 +30,8 @@ Or use `esptool` from the command line, below.
 
 | Version | Built from |
 |---|---|
-| `2.8.1.267074e` | Current. Adds the LCDWIKI 3.5" and a Heltec V3 build, on-device Quick Settings, Node Details, traceroute on the map, a spectrum analyzer + test transmitter (LoRa Actions → Spectrum), Radio Tuning, and upstream SX126x radio fixes. |
+| `2.8.1.9d8d166` | Current. Map packs: any number of areas in `/maps` on the SD card that join up, filled water/parks/woods, trails, railways, POIs and town/water names, zoom to 50 m, much faster map redraws. GPS works when wired receive-only. |
+| `2.8.1.267074e` | Adds the LCDWIKI 3.5" and a Heltec V3 build, on-device Quick Settings, Node Details, traceroute on the map, a spectrum analyzer + test transmitter (LoRa Actions → Spectrum), Radio Tuning, and upstream SX126x radio fixes. |
 | `2.8.1.1aae089` | Meshtastic 2.8.1 + this fork. |
 | `2.8.0.21d15f6` | previous release, kept for rollback |
 
@@ -52,7 +53,7 @@ image gives a garbled, mirrored or blank screen.
 pip install esptool
 esptool --chip esp32 --port COM3 --baud 460800 write-flash \
   --flash-mode dio --flash-freq 40m --flash-size 4MB \
-  0x0 bins/firmware-lcdwiki_2_8_e22_st7789-2.8.1.267074e.factory.bin
+  0x0 bins/firmware-lcdwiki_2_8_e22_st7789-2.8.1.9d8d166.factory.bin
 ```
 
 Write it at `0x0`: these are complete images including the bootloader and
@@ -92,24 +93,29 @@ Full pinout, including display and touch, is in the
 
 ## Maps
 
-The firmware ships **without** map data — you generate it for wherever you are.
+The firmware ships **without** map data — you generate a map pack for wherever you are.
 
 ```bash
 python tools/make_map.py "Edgewood, MD"
 python tools/make_map.py "Boulder, Colorado" --km 30 --no-local
-python tools/make_map.py --lat 39.4187 --lon -76.2944 --km 24 --copy-to E:\
-```
+python tools/make_map.py --lat 39.4187 --lon -76.2944 --km 24 --copy-to E:```
 
-It looks up the place, downloads from OpenStreetMap and writes `basemap.bin`.
-Copy that to the **root of a microSD card** and put the card in the node.
-`--km` sets how much area to cover; `--no-local` leaves out residential streets
-for a much smaller file.
+It looks up the place, downloads from OpenStreetMap and writes a pack such as
+`edgewood-md.map`. Put it in a folder called **`maps`** on the microSD card
+(`--copy-to` does that for you). Add as many packs as you like: neighbouring
+areas join up on the map. `--km` sets how much area to cover; `--no-local`
+leaves out residential streets and trails for a much smaller file.
 
-Needs Python 3. No API key, no account.
+A pack holds roads, water, filled parks, woods and lakes, trails, railways,
+points of interest and town and water names, at three detail levels that the map
+picks by zoom.
+
+Needs Python 3. No API key, no account. Firmware older than `2.8.1.9d8d166` reads
+only a single `basemap.bin` on the card root; make one with `make_map.py --legacy`.
 
 The map frame is one swipe right of the home screen. It plots the nodes you have
-heard, north-up around your own position, over roads and water, and names the
-streets. Swipe up and down to zoom.
+heard, north-up around your own position. Swipe up and down to zoom, from about
+50 m across out to 200 km.
 
 **Maps and Bluetooth cannot both be on.** The microSD card is mounted only while
 Bluetooth is off (Menu → Bluetooth), because the two do not fit in this board's
@@ -145,9 +151,9 @@ Known rough edges:
 ## Licence
 
 GPL-3.0, inherited from Meshtastic — see [LICENSE](LICENSE). The binaries here
-were built from commit `267074e` on the
+were built from commit `9d8d166` on the
 [`lcdwiki-2.8.1`](../../tree/lcdwiki-2.8.1) branch of this repository, which
-is the corresponding source (older images: `1aae089` on `lcdwiki-2.8.1`,
+is the corresponding source (older images: `267074e` and `1aae089` on `lcdwiki-2.8.1`,
 `21d15f6` on `lcdwiki-2.8-e22`).
 
 Map data from [OpenStreetMap](https://www.openstreetmap.org/copyright),

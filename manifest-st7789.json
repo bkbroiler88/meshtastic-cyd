@@ -1,13 +1,13 @@
 {
   "name": "Meshtastic CYD 2.8\" (ST7789)",
-  "version": "2.8.1.267074e",
+  "version": "2.8.1.9d8d166",
   "new_install_prompt_erase": true,
   "builds": [
     {
       "chipFamily": "ESP32",
       "parts": [
         {
-          "path": "bins/firmware-lcdwiki_2_8_e22_st7789-2.8.1.267074e.factory.bin",
+          "path": "bins/firmware-lcdwiki_2_8_e22_st7789-2.8.1.9d8d166.factory.bin",
           "offset": 0
         }
       ]

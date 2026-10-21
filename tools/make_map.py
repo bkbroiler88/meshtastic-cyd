@@ -9,9 +9,12 @@ geocoding so you do not have to look up coordinates.
     python tools/make_map.py --lat 39.4187 --lon -76.2944 --km 24
     python tools/make_map.py "Edgewood, MD" --copy-to E:\\        # straight onto the SD card
 
-Put the resulting basemap.bin in the root of the node's microSD card. The card is only
-mounted while Bluetooth is off, so turn Bluetooth off (Menu > Bluetooth > Disabled) to use
-maps; with Bluetooth on the map frame says so.
+The result is a map pack, e.g. edgewood-md.map. Put it in a /maps folder on the node's
+microSD card; add as many packs as you like - neighbouring areas join up on the map. The
+card is only mounted while Bluetooth is off, so turn Bluetooth off (Menu > Bluetooth >
+Disabled) to use maps; with Bluetooth on the map frame says so.
+
+--legacy writes the single basemap.bin that firmware older than map packs reads instead.
 
 Map data (c) OpenStreetMap contributors, ODbL (openstreetmap.org/copyright).
 """
@@ -21,6 +24,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import urllib.parse
@@ -60,7 +64,9 @@ def main():
     ap.add_argument("--lat", type=float, help="instead of a place name")
     ap.add_argument("--lon", type=float)
     ap.add_argument("--km", type=float, default=24.0, help="box width in km (default 24)")
-    ap.add_argument("--out", default="basemap.bin")
+    ap.add_argument("--out", help="output file (default: <place>.map, or basemap.bin with --legacy)")
+    ap.add_argument("--legacy", action="store_true",
+                    help="write the single basemap.bin (format 3) that older firmware reads")
     ap.add_argument("--copy-to", help="also copy the result here, e.g. the SD card root")
     ap.add_argument("--no-local", action="store_true",
                     help="skip residential streets: smaller file, major roads only")
@@ -75,10 +81,17 @@ def main():
     else:
         lat, lon = args.lat, args.lon
 
-    if args.km > MAX_KM:
+    if not args.out:
+        if args.legacy:
+            args.out = "basemap.bin"
+        else:
+            slug = re.sub(r"[^a-z0-9]+", "-", (args.place or f"{lat:.3f}_{lon:.3f}").lower()).strip("-")
+            args.out = (slug[:24] or "area") + ".map"
+
+    if args.legacy and args.km > MAX_KM:
         raise SystemExit(f"--km {args.km} is too wide; the format stores positions as int16 "
                          f"metres from the centre, so the limit is {MAX_KM:.0f} km.")
-    if args.km > 40:
+    if args.legacy and args.km > 40:
         print(f"note: {args.km:.0f} km is a large area. If it fails on the name blob limit, "
               f"rerun with --no-local.")
 
@@ -90,7 +103,7 @@ def main():
     spec.loader.exec_module(prep)
 
     argv = ["prepare_basemap.py", "--lat", str(lat), "--lon", str(lon), "--km", str(args.km),
-            "--grid", str(args.grid), "--out", args.out]
+            "--grid", str(args.grid), "--out", args.out, "--format", "3" if args.legacy else "4"]
     if args.no_local:
         argv.append("--no-local")
     if args.cache:
@@ -114,13 +127,21 @@ def main():
     if args.copy_to:
         dest = args.copy_to
         if os.path.isdir(dest):
-            dest = os.path.join(dest, "basemap.bin")
+            if args.legacy:
+                dest = os.path.join(dest, "basemap.bin")
+            else:
+                maps = os.path.join(dest, "maps")
+                os.makedirs(maps, exist_ok=True)
+                dest = os.path.join(maps, os.path.basename(args.out))
         shutil.copyfile(args.out, dest)
         print(f"copied to {dest}")
         print("Eject the card, put it in the node, and turn Bluetooth off to use maps.")
-    else:
+    elif args.legacy:
         print("Copy it to the root of the node's microSD card as basemap.bin.")
         print("The card is only mounted while Bluetooth is off (Menu > Bluetooth > Disabled).")
+    else:
+        print("Copy it into a folder called maps on the node's microSD card (create it if needed).")
+        print("Add more packs for more areas. The card is only mounted while Bluetooth is off.")
     print("\nMap data (c) OpenStreetMap contributors, ODbL.")
 
 
