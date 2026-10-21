@@ -30,7 +30,7 @@ Or use `esptool` from the command line, below.
 
 | Version | Built from |
 |---|---|
-| `2.8.1.9d8d166` | Current. Map packs: any number of areas in `/maps` on the SD card that join up, filled water/parks/woods, trails, railways, POIs and town/water names, zoom to 50 m, much faster map redraws. GPS works when wired receive-only. |
+| `2.8.1.9d8d166` | Current. CYD 2.8"/3.5" only: map packs (any number of areas in `/maps` on the SD card that join up, filled water/parks/woods, trails, railways, POIs, town/water names), zoom to 50 m, much faster map redraws. GPS works when wired receive-only. The Heltec V3 image (no map, no GPS) is a rebuild with no functional change. |
 | `2.8.1.267074e` | Adds the LCDWIKI 3.5" and a Heltec V3 build, on-device Quick Settings, Node Details, traceroute on the map, a spectrum analyzer + test transmitter (LoRa Actions → Spectrum), Radio Tuning, and upstream SX126x radio fixes. |
 | `2.8.1.1aae089` | Meshtastic 2.8.1 + this fork. |
 | `2.8.0.21d15f6` | previous release, kept for rollback |
