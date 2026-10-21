@@ -74,7 +74,7 @@ Rect nodesToggleRect(int16_t screenW, int16_t pTop)
 float panEastM = 0.0f;
 float panNorthM = 0.0f;
 
-constexpr float kMinRangeM = 100.0f;     // ~a city block across
+constexpr float kMinRangeM = 25.0f;      // ~a house and its neighbours across
 constexpr float kMaxRangeM = 200000.0f;  // 200 km - beyond any plausible LoRa hop
 constexpr float kZoomStep = 2.0f;        // one press halves or doubles the view
 constexpr uint32_t kStaleAfterSec = 900; // 15 min without being heard = hollow marker

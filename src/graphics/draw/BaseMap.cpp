@@ -41,7 +41,7 @@ constexpr uint32_t kTableOff = 32; // header is 32 bytes in v2, offset table fol
 // than along it. Every label knocks a hole in the geometry behind it, so they are rationed:
 // gated by zoom, ranked by road class and how much of the road is actually on screen, and
 // dropped outright when they would overlap anything already placed.
-constexpr uint8_t kLabelsMax = 6;
+constexpr uint8_t kLabelsMax = 8;
 // A name's zoom gate follows its road class: an interstate is worth naming from much
 // further out than a cul-de-sac. One flat cutoff at 8 m/px meant a 1 km view - 8.8 m/px on
 // a 228 px band - showed no names at all, which read as "the motorways have no names".
@@ -65,9 +65,48 @@ struct LabelCand {
     uint8_t src;
 };
 constexpr uint8_t kSrcArena = 0xFF;
-constexpr uint8_t kMaxCands = 24;
+// LabelCand::layer for a place or water name, rather than a road: kPlaceFlag | kind.
+// Kinds: 0 city, 1 town, 2 village, 3 suburb/hamlet/neighbourhood, 4 water.
+constexpr uint8_t kPlaceFlag = 0x10;
+constexpr uint8_t kPlaceWater = 4;
+
+/// Lower is more important. Places beat roads; a lake's name sits between major and minor roads.
+inline uint8_t labelRank(uint8_t layer)
+{
+    if (layer & kPlaceFlag) {
+        const uint8_t k = layer & 0x0F;
+        return k == kPlaceWater ? 5 : k;
+    }
+    return layer == 1 ? 4 : layer == 2 ? 6 : 7;
+}
+
+/// Widest view, in m/px, at which each place kind is still named.
+inline float placeZoomLimit(uint8_t kind)
+{
+    static const float lim[] = {2000.0f, 300.0f, 60.0f, 15.0f, 60.0f};
+    return kind < 5 ? lim[kind] : 15.0f;
+}
+constexpr uint8_t kMaxCands = 32;
 LabelCand cands[kMaxCands];
 uint8_t nCands = 0;
+
+/// Add a label candidate; when the list is full, a better one replaces the worst.
+void addCand(const LabelCand &c)
+{
+    if (nCands < kMaxCands) {
+        cands[nCands++] = c;
+        return;
+    }
+    uint8_t worst = 0;
+    for (uint8_t i = 1; i < nCands; i++) {
+        const uint8_t ri = labelRank(cands[i].layer), rw = labelRank(cands[worst].layer);
+        if (ri > rw || (ri == rw && cands[i].run < cands[worst].run))
+            worst = i;
+    }
+    const uint8_t rc = labelRank(c.layer), rw = labelRank(cands[worst].layer);
+    if (rc < rw || (rc == rw && c.run > cands[worst].run))
+        cands[worst] = c;
+}
 
 struct Rect16 {
     int16_t x, y, w, h;
@@ -202,6 +241,14 @@ constexpr uint16_t kColMinor = 0x7C11; // #7A828E cool mid grey
 constexpr uint16_t kColMajor = 0xC5F4; // #C9BFA8 warm pale sand, the brightest thing drawn
 constexpr uint16_t kColLabel = 0xFFFF; // street names, knocked out of the geometry
 constexpr uint16_t kColMapBg = 0x1082; // #101014 near-black, slightly cool
+constexpr uint16_t kColPath = 0x6A67;  // #6B4F3A trail brown, below local roads
+constexpr uint16_t kColRail = 0x8C53;  // #8A8A9A cool light grey
+// Area fills: barely lifted off the background, so lines still carry the map
+constexpr uint16_t kColFillWater = 0x1988; // #1B3344
+constexpr uint16_t kColFillPark = 0x1984;  // #1E3324
+constexpr uint16_t kColFillWood = 0x1943;  // #1A2B1E
+constexpr uint16_t kColPlace = 0xE6F8;     // #E8DCC0 town names
+constexpr uint16_t kColWaterName = 0x8E1C; // #8CC0E0 lake and river names
 
 inline uint16_t layerColor(uint8_t layer)
 {
@@ -212,6 +259,10 @@ inline uint16_t layerColor(uint8_t layer)
         return kColMajor;
     case 2:
         return kColMinor;
+    case 4:
+        return kColPath;
+    case 5:
+        return kColRail;
     default:
         return kColLocal;
     }
@@ -434,7 +485,7 @@ void drawSection(OLEDDisplay *display, File &f, const Entry &e, const BaseMap::T
             if (totalRun > 0xFFFF)
                 totalRun = 0xFFFF;
             const uint32_t nameRef = (formatVer >= kFormatV3) ? (sectionNameBase + nameId) : (uint32_t)nameId;
-            cands[nCands++] = {nameRef, (int16_t)bestX, (int16_t)bestY, (uint16_t)totalRun, layer, 0};
+            addCand({nameRef, (int16_t)bestX, (int16_t)bestY, (uint16_t)totalRun, layer, 0});
         }
     }
 }
@@ -452,10 +503,15 @@ void drawSection(OLEDDisplay *display, File &f, const Entry &e, const BaseMap::T
 //                  pad, i32 minLat/minLon/maxLat/maxLon (1e-7 deg), u32 tileCount, u32 dirOff
 //   directory:     tileCount x {u32 key, u32 off, u32 len}, sorted by key
 //                  key = level << 28 | iy << 14 | ix,  ix = floor((lon+180)*2^shift)
-//   tile:          u16 nameLen, names (u8 len + bytes), u16 wayCount,
-//                  ways: u8 layer, u16 npts, u16 nameId, npts x (i16 x, i16 y),
-//                  u16 poiCount (reserved, 0)
+//   tile:          u16 nameLen, names (u8 len + bytes)
+//                  u16 areaCount, areas: u8 kind, u16 dataLen, data = u8 nRings,
+//                        rings: u16 npts, npts x (i16 x, i16 y)   (even-odd fill)
+//                  u16 wayCount,  ways: u8 layer, u16 npts, u16 nameId, npts x (i16 x, i16 y)
+//                  u16 poiCount,  pois: u8 kind, u16 nameId, i16 x, i16 y
+//                  u16 placeCount, places: u8 kind, u16 nameId, i16 x, i16 y
 //                  x/y: 0..16384 across the tile, west->east and south->north
+//   line layers 0 water, 1 major, 2 minor, 3 local, 4 path/trail, 5 rail
+//   area kinds 0 water, 1 park, 2 wood; POI kinds 1..9 (see kPoi); place kinds as kPlaceFlag
 //
 // Tiles in view are kept in one RAM arena while Bluetooth and Wi-Fi are off (that is the
 // only time the SD card is mounted anyway, and there is ~98 KB free then). It is allocated
@@ -465,7 +521,7 @@ void drawSection(OLEDDisplay *display, File &f, const Entry &e, const BaseMap::T
 // =======================================================================================
 namespace v4
 {
-constexpr uint8_t kVersion = 4;
+constexpr uint8_t kVersion = 5;
 constexpr uint8_t kLevels = 3;
 constexpr int32_t kTileUnits = 16384;
 constexpr uint8_t kMaxPacks = 6;
@@ -829,6 +885,107 @@ struct FileSrc {
     }
 };
 
+#if defined(MESHTASTIC_MAP_DIRECT_COLOR)
+/// Even-odd scanline fill of one area record. Points are transformed on the fly per row:
+/// there is no RAM for a converted copy, and an area is at most a tile.
+void fillArea(const uint8_t *data, uint32_t len, uint8_t kind, float ax, float ay, float kx, float ky,
+              const BaseMap::Transform &t)
+{
+    struct Ring {
+        const uint8_t *p;
+        uint16_t n;
+    } rings[8];
+    uint8_t nr = 0;
+    const uint8_t *q = data, *end = data + len;
+    if (q >= end)
+        return;
+    const uint8_t nRings = *q++;
+    for (uint8_t r = 0; r < nRings && q + 2 <= end; r++) {
+        const uint16_t n = rd16(q);
+        q += 2;
+        if (q + (uint32_t)n * 4 > end)
+            break;
+        if (nr < 8 && n >= 3)
+            rings[nr++] = {q, n};
+        q += (uint32_t)n * 4;
+    }
+    if (!nr)
+        return;
+
+    float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
+    for (uint8_t r = 0; r < nr; r++)
+        for (uint16_t i = 0; i < rings[r].n; i++) {
+            const float x = ax + (float)rdi16(rings[r].p + i * 4) * kx;
+            const float y = ay - (float)rdi16(rings[r].p + i * 4 + 2) * ky;
+            minX = x < minX ? x : minX;
+            maxX = x > maxX ? x : maxX;
+            minY = y < minY ? y : minY;
+            maxY = y > maxY ? y : maxY;
+        }
+    if (maxX < t.left || minX > t.right || maxY < t.top || minY > t.bottom)
+        return;
+    if (maxX - minX < 2.0f && maxY - minY < 2.0f)
+        return; // smaller than a pixel or two: not worth a fill
+    const int32_t y0 = (int32_t)fmaxf(ceilf(minY - 0.5f), (float)t.top);
+    const int32_t y1 = (int32_t)fminf(floorf(maxY - 0.5f), (float)t.bottom);
+    const uint16_t col = kind == 0 ? kColFillWater : kind == 1 ? kColFillPark : kColFillWood;
+
+    constexpr uint8_t kMaxX = 48;
+    int16_t xs[kMaxX];
+    for (int32_t y = y0; y <= y1; y++) {
+        const float yc = (float)y + 0.5f;
+        uint8_t n = 0;
+        for (uint8_t r = 0; r < nr; r++) {
+            const Ring &rg = rings[r];
+            float px = ax + (float)rdi16(rg.p + (rg.n - 1) * 4) * kx;
+            float py = ay - (float)rdi16(rg.p + (rg.n - 1) * 4 + 2) * ky;
+            for (uint16_t i = 0; i < rg.n; i++) {
+                const float cx = ax + (float)rdi16(rg.p + i * 4) * kx;
+                const float cy = ay - (float)rdi16(rg.p + i * 4 + 2) * ky;
+                if (((py <= yc) && (cy > yc)) || ((cy <= yc) && (py > yc))) {
+                    if (n < kMaxX)
+                        xs[n++] = (int16_t)lroundf(px + (yc - py) * (cx - px) / (cy - py));
+                }
+                px = cx;
+                py = cy;
+            }
+        }
+        for (uint8_t i = 1; i < n; i++) { // insertion sort, n is small
+            const int16_t v = xs[i];
+            int8_t j = (int8_t)i - 1;
+            while (j >= 0 && xs[j] > v) {
+                xs[j + 1] = xs[j];
+                j--;
+            }
+            xs[j + 1] = v;
+        }
+        for (uint8_t i = 0; i + 1 < n; i += 2) {
+            const int16_t xa = xs[i] < t.left ? t.left : xs[i];
+            const int16_t xb = xs[i + 1] > t.right ? t.right : xs[i + 1];
+            if (xb > xa)
+                graphics::tftDirectFillRect(xa, (int16_t)y, (int16_t)(xb - xa), 1, col);
+        }
+    }
+}
+
+/// POI kinds 1..9: a coloured badge with a letter.
+void drawPoi(uint8_t kind, int16_t x, int16_t y, float mPerPx, const BaseMap::Transform &t)
+{
+    static const char *const letters[] = {"?", "H", "F", "P", "W", "S", "^", "T", "C", "V"};
+    static const uint16_t colours[] = {0x7BEF, 0xC987, 0xCC45, 0x3B36, 0x2CB6, 0x3C6A, 0x8B6A, 0x7BD1, 0x53C7, 0x8AD6};
+    if (kind == 0 || kind > 9)
+        return;
+    if (kind == 3 && mPerPx > 1.5f)
+        return; // parking is everywhere: only when right in close
+    constexpr int16_t r = 6;
+    if (x - r < t.left || x + r > t.right || y - r < t.top || y + r > t.bottom)
+        return;
+    graphics::tftDirectFillRoundRect((int16_t)(x - r), (int16_t)(y - r), 2 * r + 1, 2 * r + 1, 3, colours[kind]);
+    graphics::tftDirectTextF(x, y, letters[kind], 0xFFFF, colours[kind], TftFont::Small, true);
+    BaseMap::reserve((int16_t)(x - r), (int16_t)(y - r), 2 * r + 1, 2 * r + 1);
+}
+#endif
+
 template <class Src>
 void drawTile(OLEDDisplay *display, Src &src, uint8_t srcId, uint32_t key, uint8_t shift, const BaseMap::Transform &t, bool drawLocal,
               float inv)
@@ -849,6 +1006,29 @@ void drawTile(OLEDDisplay *display, Src &src, uint8_t srcId, uint32_t key, uint8
     const uint32_t nameBase = src.pos;
     if (!src.skip(rd16(b2)) || !src.read(b2, 2))
         return;
+
+    // Areas first, so every line lands on top of them. Fills are colour-panel only.
+    const uint16_t nAreas = rd16(b2);
+    for (uint16_t a = 0; a < nAreas; a++) {
+        uint8_t ah[3];
+        if (!src.read(ah, 3))
+            return;
+        const uint16_t dataLen = rd16(ah + 1);
+#if defined(MESHTASTIC_MAP_DIRECT_COLOR)
+        if (directColor && dataLen <= kWindow) {
+            const uint8_t *data = src.points(dataLen);
+            if (!data)
+                return;
+            fillArea(data, dataLen, ah[0], ax, ay, kx, ky, t);
+            continue;
+        }
+#endif
+        if (!src.skip(dataLen))
+            return;
+    }
+
+    if (!src.read(b2, 2))
+        return;
     const uint16_t nWays = rd16(b2);
 
     for (uint16_t w = 0; w < nWays; w++) {
@@ -860,12 +1040,14 @@ void drawTile(OLEDDisplay *display, Src &src, uint8_t srcId, uint32_t key, uint8
         const uint16_t nameId = rd16(wh + 3);
         if (npts == 0)
             continue;
-        if (layer == 3 && !drawLocal) {
+        // Residential streets once a pixel is a few metres, trails sooner, rail only out to
+        // a regional view: skip the payload outright.
+        if ((layer == 3 && !drawLocal) || (layer == 4 && t.mPerPx > 3.0f) || (layer == 5 && t.mPerPx > 30.0f)) {
             if (!src.skip((uint32_t)npts * 4))
                 return;
             continue;
         }
-        const bool wantName = (nameId != kNameNone && layer != 0 && nCands < kMaxCands);
+        const bool wantName = (nameId != kNameNone && layer >= 1 && layer <= 3);
         int32_t totalRun = 0, bestSeg = 0, bestX = 0, bestY = 0;
         int32_t px = 0, py = 0;
         bool first = true;
@@ -899,8 +1081,41 @@ void drawTile(OLEDDisplay *display, Src &src, uint8_t srcId, uint32_t key, uint8
         if (wantName && bestSeg > 0) {
             if (totalRun > 0xFFFF)
                 totalRun = 0xFFFF;
-            cands[nCands++] = {nameBase + nameId, (int16_t)bestX, (int16_t)bestY, (uint16_t)totalRun, layer, srcId};
+            addCand({nameBase + nameId, (int16_t)bestX, (int16_t)bestY, (uint16_t)totalRun, layer, srcId});
         }
+    }
+
+    // POIs: drawn now, so names placed later avoid them. Close zoom only.
+    if (!src.read(b2, 2))
+        return;
+    const uint16_t nPois = rd16(b2);
+    for (uint16_t i = 0; i < nPois; i++) {
+        uint8_t ph[7];
+        if (!src.read(ph, 7))
+            return;
+#if defined(MESHTASTIC_MAP_DIRECT_COLOR)
+        if (directColor && t.mPerPx <= 4.0f)
+            drawPoi(ph[0], (int16_t)lroundf(ax + (float)rdi16(ph + 3) * kx), (int16_t)lroundf(ay - (float)rdi16(ph + 5) * ky),
+                    t.mPerPx, t);
+#endif
+    }
+
+    // Place and water names become label candidates, ranked above street names.
+    if (!src.read(b2, 2))
+        return;
+    const uint16_t nPlaces = rd16(b2);
+    for (uint16_t i = 0; i < nPlaces; i++) {
+        uint8_t ph[7];
+        if (!src.read(ph, 7))
+            return;
+        const uint8_t kind = ph[0];
+        const uint16_t nameId = rd16(ph + 1);
+        if (nameId == kNameNone || t.mPerPx > placeZoomLimit(kind))
+            continue;
+        const int32_t x = lroundf(ax + (float)rdi16(ph + 3) * kx), y = lroundf(ay - (float)rdi16(ph + 5) * ky);
+        if (x < t.left || x > t.right || y < t.top || y > t.bottom)
+            continue;
+        addCand({nameBase + nameId, (int16_t)x, (int16_t)y, 0xFFFF, (uint8_t)(kPlaceFlag | (kind & 0x0F)), srcId});
     }
 }
 
@@ -1040,16 +1255,16 @@ void BaseMap::reserve(int16_t x, int16_t y, int16_t w, int16_t h)
 void BaseMap::drawLabels(OLEDDisplay *display, const Transform &t)
 {
     // nameLen is only meaningful for v2; v3 keeps names per section and leaves it zero.
-    if (!ok || nCands == 0 || (!usePacks && formatVer < kFormatV3 && nameLen == 0) || t.mPerPx > kLabelZoomMPerPx)
+    if (!ok || nCands == 0 || (!usePacks && formatVer < kFormatV3 && nameLen == 0))
         return;
 
-    // Rank: major roads first, then by how much of the road is on screen. Selection sort -
-    // at most 24 entries, and it avoids pulling in <algorithm>.
+    // Rank: places, then major roads, then by how much of the road is on screen. Selection
+    // sort - a few dozen entries, and it avoids pulling in <algorithm>.
     for (uint8_t i = 0; i < nCands; i++) {
         uint8_t best = i;
         for (uint8_t j = i + 1; j < nCands; j++) {
-            const bool better = (cands[j].layer < cands[best].layer) ||
-                                (cands[j].layer == cands[best].layer && cands[j].run > cands[best].run);
+            const uint8_t rj = labelRank(cands[j].layer), rb = labelRank(cands[best].layer);
+            const bool better = (rj < rb) || (rj == rb && cands[j].run > cands[best].run);
             if (better)
                 best = j;
         }
@@ -1087,10 +1302,15 @@ void BaseMap::drawLabels(OLEDDisplay *display, const Transform &t)
 
     for (uint8_t i = 0; i < nCands && placed < kLabelsMax; i++) {
         const LabelCand &c = cands[i];
-        if (c.layer >= 3 && t.mPerPx > kLocalZoomMPerPx)
-            continue;
-        if (c.layer == 2 && t.mPerPx > kMinorZoomMPerPx)
-            continue;
+        const bool isPlace = (c.layer & kPlaceFlag) != 0;
+        if (!isPlace) {
+            if (t.mPerPx > kLabelZoomMPerPx)
+                continue;
+            if (c.layer >= 3 && t.mPerPx > kLocalZoomMPerPx)
+                continue;
+            if (c.layer == 2 && t.mPerPx > kMinorZoomMPerPx)
+                continue;
+        }
 
         uint8_t len = 0;
         if (usePacks && c.src == kSrcArena) {
@@ -1133,23 +1353,35 @@ void BaseMap::drawLabels(OLEDDisplay *display, const Transform &t)
         if (dupe)
             continue;
 
-        const int16_t w = (int16_t)display->getStringWidth(name, len, false);
-        if (w <= 0 || (int32_t)c.run < (int32_t)(w * kMinRunFactor))
+        // Cities and towns get the large font on the colour panel.
+        const uint8_t placeKind = c.layer & 0x0F;
+        bool large = false;
+        int16_t w = 0, th = FONT_HEIGHT_SMALL;
+#if defined(MESHTASTIC_MAP_DIRECT_COLOR)
+        if (directColor) {
+            large = isPlace && placeKind <= 1;
+            const TftFont font = large ? TftFont::Large : TftFont::Small;
+            w = graphics::tftDirectTextWidthF(name, font);
+            th = graphics::tftDirectTextHeightF(font);
+        } else
+#endif
+            w = (int16_t)display->getStringWidth(name, len, false);
+        if (w <= 0 || (!isPlace && (int32_t)c.run < (int32_t)(w * kMinRunFactor)))
             continue; // not enough road on screen to own this name
 
         int16_t x = (int16_t)(c.x - w / 2);
-        int16_t y = (int16_t)(c.y - FONT_HEIGHT_SMALL / 2);
+        int16_t y = (int16_t)(c.y - th / 2);
         if (x < t.left)
             x = t.left;
         if (x + w > t.right)
             x = (int16_t)(t.right - w);
         if (y < t.top)
             y = t.top;
-        if (y + FONT_HEIGHT_SMALL > t.bottom)
-            y = (int16_t)(t.bottom - FONT_HEIGHT_SMALL);
+        if (y + th > t.bottom)
+            y = (int16_t)(t.bottom - th);
 
         const int16_t bx = (int16_t)(x - kLabelPad), bw = (int16_t)(w + 2 * kLabelPad);
-        if (overlaps(bx, y, bw, FONT_HEIGHT_SMALL))
+        if (overlaps(bx, y, bw, th))
             continue; // never shuffle a label away from its road - drop it instead
 
         // Knock the geometry out from behind the text: a name laid straight over road lines
@@ -1158,7 +1390,8 @@ void BaseMap::drawLabels(OLEDDisplay *display, const Transform &t)
         if (directColor) {
             // The band has one owner, so a label cannot be left in the 1-bit buffer: the
             // blit never reaches these rows. Opaque text gives the knock-out for free.
-            graphics::tftDirectText(x, y, name, kColLabel, kColMapBg);
+            const uint16_t fg = !isPlace ? kColLabel : placeKind == kPlaceWater ? kColWaterName : kColPlace;
+            graphics::tftDirectTextF(x, y, name, fg, kColMapBg, large ? TftFont::Large : TftFont::Small);
         } else
 #endif
         {
@@ -1168,7 +1401,7 @@ void BaseMap::drawLabels(OLEDDisplay *display, const Transform &t)
             display->drawString(x, y, name);
         }
 
-        reserve(bx, y, bw, FONT_HEIGHT_SMALL);
+        reserve(bx, y, bw, th);
         placedIds[placed] = h;
         placedX[placed] = c.x;
         placedY[placed] = c.y;
