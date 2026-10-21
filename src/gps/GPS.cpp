@@ -1968,6 +1968,80 @@ GnssModel_t GPS::getProbeResponse(unsigned long timeout, const std::vector<ChipI
     return GNSS_MODEL_UNKNOWN; // Return unknown on timeout
 }
 
+#if defined(ARCH_ESP32)
+/// A receiver we cannot transmit to: no TX wire, or TX given up to another peripheral. It
+/// cannot be probed or configured, so listen at each baud until framed NMEA arrives and
+/// parse it as generic NMEA (the caller sets GNSS_MODEL_GENERIC_NMEA).
+static void beginRxOnlyNmea(HardwareSerial *ser, int8_t rxPin)
+{
+    // We cannot ask the receiver to change baud, but we CAN listen at each rate and
+    // see which one produces framed sentences - sawNmeaSentenceAtBaud() is passive,
+    // it only watches for "$...,". Without this the hardcoded GPS_BAUDRATE is a
+    // guess, and a module streaming at 38400 looks identical to one that is not
+    // wired at all: both yield zero valid sentences forever.
+    static const uint32_t kRxOnlyBauds[] = {GPS_BAUDRATE, 9600, 38400, 115200, 57600, 19200, 4800};
+    uint32_t chosenBaud = 0;
+    uint32_t bytesAtChosen = 0;
+    uint32_t bytesSeenTotal = 0;
+
+    for (uint32_t baud : kRxOnlyBauds) {
+        // end() before re-begin: reconfiguring a live UART in place leaves the
+        // driver holding the old pin matrix and ring buffer, so later rates in this
+        // loop would read whatever the first one left behind.
+        ser->end();
+        ser->begin(baud, SERIAL_8N1, rxPin, -1);
+        delay(50); // let the line settle before counting
+
+        // Count and frame in ONE pass. sawNmeaSentenceAtBaud() consumes what it
+        // reads, so asking available() afterwards reports the drained buffer, not
+        // what arrived - that reads as "zero bytes" whether the receiver is silent
+        // or streaming perfectly, which is exactly the wrong thing to be sure about.
+        uint32_t bytes = 0;
+        bool sawDollar = false, sawComma = false, framed = false;
+        const uint32_t deadline = millis() + 1200;
+        while (!framed && (int32_t)(millis() - deadline) < 0) {
+            while (ser->available()) {
+                const char c = static_cast<char>(ser->read());
+                bytes++;
+                if (c == '$') {
+                    sawDollar = true;
+                    sawComma = false;
+                } else if (c == ',') {
+                    sawComma = true;
+                } else if (c == '\n' || c == '\r') {
+                    if (sawDollar && sawComma) {
+                        framed = true;
+                        break;
+                    }
+                    sawDollar = sawComma = false;
+                }
+            }
+        }
+
+        bytesSeenTotal += bytes;
+        LOG_DEBUG_GPS("GPS baud probe %u: %u bytes, framed=%d", (unsigned)baud, (unsigned)bytes, (int)framed);
+        if (framed) {
+            chosenBaud = baud;
+            bytesAtChosen = bytes;
+            break;
+        }
+    }
+
+    ser->end();
+    if (chosenBaud) {
+        ser->begin(chosenBaud, SERIAL_8N1, rxPin, -1);
+        LOG_INFO("GPS is RX-only: generic NMEA at %u baud on GPIO%d (%u bytes)", (unsigned)chosenBaud,
+                 rxPin, (unsigned)bytesAtChosen);
+    } else {
+        ser->begin(GPS_BAUDRATE, SERIAL_8N1, rxPin, -1);
+        LOG_WARN("GPS is RX-only: no NMEA at any baud on GPIO%d; %u bytes total across all rates. "
+                 "Nonzero means the line is live but framing is wrong; zero means nothing reaches "
+                 "the pin. Falling back to %d",
+                 rxPin, (unsigned)bytesSeenTotal, GPS_BAUDRATE);
+    }
+}
+#endif
+
 std::unique_ptr<GPS> GPS::createGps()
 {
     int8_t _rx_gpio = config.position.rx_gpio;
@@ -2126,71 +2200,7 @@ std::unique_ptr<GPS> GPS::createGps()
             // the NMEA that arrives.
             new_gps->gnssModel = GNSS_MODEL_GENERIC_NMEA;
 
-            // We cannot ask the receiver to change baud, but we CAN listen at each rate and
-            // see which one produces framed sentences - sawNmeaSentenceAtBaud() is passive,
-            // it only watches for "$...,". Without this the hardcoded GPS_BAUDRATE is a
-            // guess, and a module streaming at 38400 looks identical to one that is not
-            // wired at all: both yield zero valid sentences forever.
-            static const uint32_t kRxOnlyBauds[] = {GPS_BAUDRATE, 9600, 38400, 115200, 57600, 19200, 4800};
-            uint32_t chosenBaud = 0;
-            uint32_t bytesAtChosen = 0;
-            uint32_t bytesSeenTotal = 0;
-
-            for (uint32_t baud : kRxOnlyBauds) {
-                // end() before re-begin: reconfiguring a live UART in place leaves the
-                // driver holding the old pin matrix and ring buffer, so later rates in this
-                // loop would read whatever the first one left behind.
-                _serial_gps->end();
-                _serial_gps->begin(baud, SERIAL_8N1, new_gps->rx_gpio, -1);
-                delay(50); // let the line settle before counting
-
-                // Count and frame in ONE pass. sawNmeaSentenceAtBaud() consumes what it
-                // reads, so asking available() afterwards reports the drained buffer, not
-                // what arrived - that reads as "zero bytes" whether the receiver is silent
-                // or streaming perfectly, which is exactly the wrong thing to be sure about.
-                uint32_t bytes = 0;
-                bool sawDollar = false, sawComma = false, framed = false;
-                const uint32_t deadline = millis() + 1200;
-                while (!framed && (int32_t)(millis() - deadline) < 0) {
-                    while (_serial_gps->available()) {
-                        const char c = static_cast<char>(_serial_gps->read());
-                        bytes++;
-                        if (c == '$') {
-                            sawDollar = true;
-                            sawComma = false;
-                        } else if (c == ',') {
-                            sawComma = true;
-                        } else if (c == '\n' || c == '\r') {
-                            if (sawDollar && sawComma) {
-                                framed = true;
-                                break;
-                            }
-                            sawDollar = sawComma = false;
-                        }
-                    }
-                }
-
-                bytesSeenTotal += bytes;
-                LOG_DEBUG_GPS("GPS baud probe %u: %u bytes, framed=%d", (unsigned)baud, (unsigned)bytes, (int)framed);
-                if (framed) {
-                    chosenBaud = baud;
-                    bytesAtChosen = bytes;
-                    break;
-                }
-            }
-
-            _serial_gps->end();
-            if (chosenBaud) {
-                _serial_gps->begin(chosenBaud, SERIAL_8N1, new_gps->rx_gpio, -1);
-                LOG_INFO("GPS is RX-only: generic NMEA at %u baud on GPIO%d (%u bytes)", (unsigned)chosenBaud,
-                         new_gps->rx_gpio, (unsigned)bytesAtChosen);
-            } else {
-                _serial_gps->begin(GPS_BAUDRATE, SERIAL_8N1, new_gps->rx_gpio, -1);
-                LOG_WARN("GPS is RX-only: no NMEA at any baud on GPIO%d; %u bytes total across all rates. "
-                         "Nonzero means the line is live but framing is wrong; zero means nothing reaches "
-                         "the pin. Falling back to %d",
-                         new_gps->rx_gpio, (unsigned)bytesSeenTotal, GPS_BAUDRATE);
-            }
+            beginRxOnlyNmea(_serial_gps, new_gps->rx_gpio);
         } else {
             // tx_gpio == 0 means "unset", not "GPIO0" - and GPIO0 is the boot button on
             // this board, so hand the UART -1 rather than letting it drive that pin.
@@ -2199,7 +2209,16 @@ std::unique_ptr<GPS> GPS::createGps()
             _serial_gps->begin(GPS_BAUDRATE, SERIAL_8N1, new_gps->rx_gpio, txPin);
         }
 #else
-        _serial_gps->begin(GPS_BAUDRATE, SERIAL_8N1, new_gps->rx_gpio, new_gps->tx_gpio);
+        // tx_gpio is uint32_t, so a variant's GPS_TX_PIN -1 arrives as 0xFFFFFFFF: compare signed.
+        if ((int32_t)new_gps->tx_gpio <= 0) {
+            // RX-only wiring (tx -1 or unset): probing writes commands and waits for replies,
+            // which never come, so setup() would loop on "No GNSS Module" while the receiver
+            // streams perfectly good NMEA. Listen instead.
+            new_gps->gnssModel = GNSS_MODEL_GENERIC_NMEA;
+            beginRxOnlyNmea(_serial_gps, new_gps->rx_gpio);
+        } else {
+            _serial_gps->begin(GPS_BAUDRATE, SERIAL_8N1, new_gps->rx_gpio, new_gps->tx_gpio);
+        }
 #endif
 #elif defined(ARCH_RP2040)
         _serial_gps->setPinout(new_gps->tx_gpio, new_gps->rx_gpio);
