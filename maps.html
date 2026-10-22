@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Map Builder</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="mappack.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh;
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: #0f172a; color: #e8eaed;
+    display: flex; flex-direction: column; align-items: center;
+    padding: 32px 16px;
+  }
+  main { max-width: 760px; width: 100%; }
+  h1 { font-size: 1.6rem; margin: 0 0 .2em; }
+  .sub { color: #9aa3ad; margin: 0 0 1.5rem; }
+  .card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 18px 20px; margin-bottom: 16px; }
+  .card h2 { font-size: 1.05rem; margin: 0 0 .6em; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  input[type=text] { flex: 1 1 220px; min-width: 0; padding: 9px 11px; border-radius: 7px; border: 1px solid #475569; background: #0f172a; color: #e8eaed; font: inherit; }
+  button { padding: 9px 16px; border-radius: 7px; border: 1px solid #475569; background: #0f172a; color: #67ea94; font: inherit; cursor: pointer; }
+  button.primary { background: #67ea94; color: #0f172a; border-color: #67ea94; font-weight: 600; }
+  button:disabled { opacity: .45; cursor: default; }
+  #map { height: 360px; border-radius: 8px; border: 1px solid #334155; margin-top: 12px; }
+  .opts { display: grid; grid-template-columns: 1fr; gap: 10px; margin-top: 12px; }
+  .opts label { color: #cbd5e1; font-size: .95rem; }
+  input[type=range] { width: 100%; accent-color: #67ea94; }
+  .note { font-size: .85rem; color: #94a3b8; margin: .4rem 0 0; }
+  #log { font: 13px/1.5 ui-monospace, Consolas, monospace; color: #94a3b8; background: #0f172a; border-radius: 6px; padding: 10px 12px; min-height: 2.5em; white-space: pre-wrap; margin-top: 12px; }
+  #result { display: none; }
+  #preview { width: 100%; max-width: 480px; aspect-ratio: 3 / 2; display: block; margin: 12px 0; border-radius: 6px; border: 1px solid #334155; background: #101014; image-rendering: pixelated; }
+  .stats { font-size: .9rem; color: #cbd5e1; }
+  code { background: #0f172a; padding: 1px 6px; border-radius: 4px; font-size: .9em; }
+  ol { padding-left: 1.2em; margin: .4em 0 0; color: #cbd5e1; }
+  a { color: #67ea94; }
+  footer { color: #6b747e; font-size: .85rem; margin-top: 1.5rem; text-align: center; }
+  .warn { color: #f2c75c; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Map Builder</h1>
+  <p class="sub">Make an offline map pack for the Meshtastic CYD map screen, straight from your browser.
+     Pick an area, build, and copy the file to the node's SD card. No install, no account.</p>
+
+  <div class="card">
+    <h2>1. Pick the area</h2>
+    <div class="row">
+      <input id="q" type="text" placeholder="Town or place, e.g. Edgewood, MD" autocomplete="off">
+      <button id="find">Find</button>
+    </div>
+    <div id="map" role="application" aria-label="Map: click to set the centre of the area"></div>
+    <p class="note">Click the map to move the centre. The green box is what goes in the pack.</p>
+    <div class="opts">
+      <div>
+        <label for="km">Box size: <b id="kmv">24 km</b> across</label>
+        <input id="km" type="range" min="4" max="60" step="2" value="24">
+      </div>
+      <label><input id="local" type="checkbox" checked> Residential streets and trails
+        <span class="note">(turn off for big areas: much smaller and faster)</span></label>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>2. Build</h2>
+    <button id="build" class="primary">Build map pack</button>
+    <div id="log" aria-live="polite">Ready.</div>
+    <div id="result">
+      <canvas id="preview" width="480" height="320" aria-label="Preview of the map pack"></canvas>
+      <div class="stats" id="stats"></div>
+      <p><button id="dl" class="primary">Download</button></p>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>3. Put it on the node</h2>
+    <ol>
+      <li>Make a folder called <code>maps</code> in the root of the node's microSD card.</li>
+      <li>Copy the <code>.map</code> file into it. Add as many as you like: neighbouring areas join up.</li>
+      <li>Put the card in the node and turn <b>Bluetooth off</b> (the card is only mounted then). Open the map screen.</li>
+    </ol>
+    <p class="note">Needs firmware <code>2.8.1.9d8d166</code> or newer. For a whole state or region, use
+      <code>tools/make_map_region.py</code> on a PC instead. See the <a href="README.md">README</a>.</p>
+  </div>
+
+  <footer>
+    Map data © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>, ODbL ·
+    downloaded through the <a href="https://overpass-api.de/">Overpass API</a> ·
+    <a href="./">Web flasher</a>
+  </footer>
+</main>
+
+<script>
+(function () {
+  'use strict';
+  const ENDPOINTS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
+  const $ = (id) => document.getElementById(id);
+  let centre = { lat: 39.4187, lon: -76.2944 };
+  let placeName = 'Edgewood, MD';
+  let packBytes = null;
+
+  const map = L.map('map', { zoomControl: true }).setView([centre.lat, centre.lon], 10);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 18, attribution: '© OpenStreetMap contributors',
+  }).addTo(map);
+  const box = L.rectangle([[0, 0], [0, 0]], { color: '#67ea94', weight: 2, fillOpacity: 0.08 }).addTo(map);
+  const pin = L.circleMarker([centre.lat, centre.lon], { radius: 5, color: '#67ea94', fillOpacity: 1 }).addTo(map);
+
+  function km() { return Number($('km').value); }
+  function drawBox(fit) {
+    const b = MapPack.bboxFor(centre.lat, centre.lon, km());
+    box.setBounds([[b.south, b.west], [b.north, b.east]]);
+    pin.setLatLng([centre.lat, centre.lon]);
+    $('kmv').textContent = km() + ' km';
+    // Fitting while the map has no size (hidden, or still laying out) zooms to the maximum
+    if (fit && map.getSize().x > 0) map.fitBounds(box.getBounds(), { padding: [20, 20] });
+  }
+  drawBox(true);
+  // Leaflet measures its container once; re-measure and re-fit whenever the size changes
+  let lastW = 0;
+  new ResizeObserver(() => {
+    map.invalidateSize();
+    const w = map.getSize().x;
+    if (w > 0 && lastW === 0) drawBox(true);
+    lastW = w;
+  }).observe($('map'));
+
+  map.on('click', (e) => {
+    centre = { lat: e.latlng.lat, lon: e.latlng.lng };
+    placeName = '';
+    drawBox(false);
+  });
+  $('km').addEventListener('input', () => drawBox(false));
+  $('km').addEventListener('change', () => drawBox(true));
+
+  function log(msg) { $('log').textContent = msg; }
+
+  async function find() {
+    const q = $('q').value.trim();
+    if (!q) return;
+    log('Looking up ' + q + '...');
+    try {
+      const r = await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' + encodeURIComponent(q));
+      const hits = await r.json();
+      if (!hits.length) { log('Could not find "' + q + '". Try adding a state or country.'); return; }
+      centre = { lat: Number(hits[0].lat), lon: Number(hits[0].lon) };
+      placeName = q;
+      drawBox(true);
+      log('Found: ' + hits[0].display_name);
+    } catch (e) {
+      log('Search failed: ' + e.message);
+    }
+  }
+  $('find').addEventListener('click', find);
+  $('q').addEventListener('keydown', (e) => { if (e.key === 'Enter') find(); });
+
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+
+  async function overpass(query) {
+    let last = null;
+    for (const url of ENDPOINTS) {
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        log('Downloading from OpenStreetMap (' + new URL(url).host + ', try ' + attempt + ')...\nA town takes a minute; a big box with streets can take several.');
+        try {
+          const r = await fetch(url, { method: 'POST', body: 'data=' + encodeURIComponent(query),
+                                       headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return await r.json();
+        } catch (e) {
+          last = e;
+          await new Promise((res) => setTimeout(res, 3000 * attempt));
+        }
+      }
+    }
+    throw new Error('the OpenStreetMap servers did not answer (' + (last && last.message) + '). Try again in a few minutes, or use a smaller box.');
+  }
+
+  function slug() {
+    const base = placeName || (centre.lat.toFixed(3) + '_' + centre.lon.toFixed(3));
+    return (base.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 24) || 'area') + '.map';
+  }
+
+  $('build').addEventListener('click', async () => {
+    $('build').disabled = true;
+    $('result').style.display = 'none';
+    packBytes = null;
+    try {
+      const k = km(), includeLocal = $('local').checked;
+      const query = MapPack.buildQuery(MapPack.bboxFor(centre.lat, centre.lon, k), includeLocal);
+      const data = await overpass(query);
+      log('Got ' + (data.elements || []).length.toLocaleString() + ' map features. Building the pack...');
+      await tick();
+      const t0 = performance.now();
+      const res = MapPack.build(data, centre.lat, centre.lon, k, includeLocal);
+      packBytes = res.bytes;
+      const s = res.stats;
+      log('Done in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s.');
+      $('stats').innerHTML = '<b>' + slug() + '</b>: ' + (packBytes.length / 1024).toFixed(0) + ' KB, ' + s.tiles + ' tiles<br>' +
+        s.lines.toLocaleString() + ' roads and paths, ' + s.areas.toLocaleString() + ' parks, woods and lakes, ' +
+        s.pois.toLocaleString() + ' points of interest, ' + s.places.toLocaleString() + ' place names' +
+        (s.levels[1].largest > 32768 ? '<br><span class="warn">Some tiles are large; the map will redraw a little slower in the middle zooms.</span>' : '');
+      preview(packBytes, centre, k);
+      $('result').style.display = 'block';
+    } catch (e) {
+      log('Build failed: ' + e.message);
+    } finally {
+      $('build').disabled = false;
+    }
+  });
+
+  $('dl').addEventListener('click', () => {
+    if (!packBytes) return;
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([packBytes], { type: 'application/octet-stream' }));
+    a.download = slug();
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  });
+
+  // --- preview: draws the pack the way the node does, at the detail level for this zoom ---
+  const LINE_COL = ['#27485c', '#c9bfa8', '#7a828e', '#4e555f', '#6b4f3a', '#8a8a9a'];
+  const LINE_W = [1, 2, 1, 1, 1, 1];
+  const AREA_COL = ['#1b3344', '#1e3324', '#1a2b1e'];
+  const POI = { 1: ['H', '#c8323c'], 2: ['F', '#c88a28'], 3: ['P', '#3c64b4'], 4: ['W', '#2896b4'], 5: ['S', '#3c8c50'],
+                6: ['^', '#8c6e50'], 7: ['T', '#78788c'], 8: ['C', '#50783c'], 9: ['V', '#8c5ab4'] };
+
+  function preview(bytes, c, k) {
+    const cv = $('preview'), g = cv.getContext('2d');
+    const W = cv.width, H = cv.height;
+    const mPerPx = (k * 1000) / W;
+    const level = mPerPx <= 8 ? 2 : mPerPx <= 25 ? 1 : 0;
+    const mLon = 111320 * Math.cos(c.lat * Math.PI / 180), mLat = 111132;
+    const P = (lon, lat) => [W / 2 + (lon - c.lon) * mLon / mPerPx, H / 2 - (lat - c.lat) * mLat / mPerPx];
+    g.fillStyle = '#101014'; g.fillRect(0, 0, W, H);
+    const pk = MapPack.decode(bytes);
+    const dv = pk.dv, labels = [];
+    const rd = (o) => dv.getInt16(o, true), ru = (o) => dv.getUint16(o, true);
+    for (const t of pk.tiles) {
+      if (t.lv !== level) continue;
+      const T = (x, y) => P(t.lon0 + x / 16384 * t.span, t.lat0 + y / 16384 * t.span);
+      let p = t.off;
+      const nlen = ru(p); p += 2; const nbase = p; p += nlen;
+      const nameAt = (id) => { if (id === 0xffff) return ''; const L = bytes[nbase + id]; return new TextDecoder().decode(bytes.subarray(nbase + id + 1, nbase + id + 1 + L)); };
+      const na = ru(p); p += 2;
+      for (let i = 0; i < na; i++) {
+        const kind = bytes[p], dl = ru(p + 1); let q = p + 3; p += 3 + dl;
+        const nr = bytes[q]; q += 1;
+        g.beginPath();
+        for (let r = 0; r < nr; r++) {
+          const n = ru(q); q += 2;
+          for (let j = 0; j < n; j++) { const [x, y] = T(rd(q + j * 4), rd(q + j * 4 + 2)); j ? g.lineTo(x, y) : g.moveTo(x, y); }
+          g.closePath(); q += n * 4;
+        }
+        g.fillStyle = AREA_COL[kind] || AREA_COL[1]; g.fill('evenodd');
+      }
+      const nw = ru(p); p += 2;
+      for (let i = 0; i < nw; i++) {
+        const layer = bytes[p], n = ru(p + 1); p += 5;
+        const skip = (layer === 3 && mPerPx > 8) || (layer === 4 && mPerPx > 3) || (layer === 5 && mPerPx > 30);
+        if (!skip) {
+          g.beginPath();
+          for (let j = 0; j < n; j++) { const [x, y] = T(rd(p + j * 4), rd(p + j * 4 + 2)); j ? g.lineTo(x, y) : g.moveTo(x, y); }
+          g.strokeStyle = LINE_COL[layer] || '#888'; g.lineWidth = LINE_W[layer] || 1; g.stroke();
+        }
+        p += n * 4;
+      }
+      const np = ru(p); p += 2;
+      for (let i = 0; i < np; i++) {
+        const kind = bytes[p]; const [x, y] = T(rd(p + 3), rd(p + 5)); p += 7;
+        if (mPerPx <= 4 && POI[kind] && !(kind === 3 && mPerPx > 1.5)) {
+          g.fillStyle = POI[kind][1]; g.fillRect(x - 5, y - 5, 11, 11);
+          g.fillStyle = '#fff'; g.font = 'bold 9px sans-serif'; g.textAlign = 'center'; g.fillText(POI[kind][0], x, y + 3);
+        }
+      }
+      const npl = ru(p); p += 2;
+      const lim = [2000, 300, 60, 15, 60];
+      for (let i = 0; i < npl; i++) {
+        const kind = bytes[p], nid = ru(p + 1); const [x, y] = T(rd(p + 3), rd(p + 5)); p += 7;
+        if (mPerPx <= (lim[kind] || 15)) labels.push([kind, nameAt(nid), x, y]);
+      }
+    }
+    labels.sort((a, b) => a[0] - b[0]);
+    const placed = [];
+    g.textAlign = 'center';
+    for (const [kind, s, x, y] of labels.slice(0, 12)) {
+      g.font = (kind <= 1 ? 'bold 14px ' : '11px ') + 'system-ui, sans-serif';
+      const w = g.measureText(s).width;
+      if (placed.some((r) => Math.abs(r[0] - x) < (w + r[2]) / 2 && Math.abs(r[1] - y) < 14)) continue;
+      placed.push([x, y, w]);
+      g.fillStyle = '#101014'; g.fillRect(x - w / 2 - 2, y - 10, w + 4, 13);
+      g.fillStyle = kind === 4 ? '#8cc0e0' : '#e8dcc0'; g.fillText(s, x, y);
+    }
+  }
+})();
+</script>
+</body>
+</html>

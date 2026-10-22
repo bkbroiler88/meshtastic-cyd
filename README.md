@@ -120,6 +120,20 @@ commit `3f959ae` on `lcdwiki-2.8.1` (`9d8d166` plus the Piglet frame).
 
 The firmware ships **without** map data — you generate a map pack for wherever you are.
 
+**Easiest: the [Map Builder](https://bkbroiler88.github.io/meshtastic-cyd/maps.html).** Find
+a town or click the map, pick a size, Build, Download. It runs in the browser (Chrome,
+Edge, Firefox or Safari) and makes exactly the same pack as the command-line tool.
+
+**For a whole state or region**, use `tools/make_map_region.py`. It reads a Geofabrik
+extract instead of querying Overpass, so there is no rate limit; Delaware takes about a
+minute. Needs `pip install osmium`.
+
+```bash
+python tools/make_map_region.py --region us/maryland --no-local
+python tools/make_map_region.py --region europe/malta --copy-to E:```
+
+**Or from the command line**, for a town:
+
 ```bash
 python tools/make_map.py "Edgewood, MD"
 python tools/make_map.py "Boulder, Colorado" --km 30 --no-local
