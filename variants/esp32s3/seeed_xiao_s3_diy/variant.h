@@ -68,6 +68,10 @@ L76K GPS Module Information : https://www.seeedstudio.com/L76K-GNSS-Module-for-S
 // up. USE_SSD1306 is the macro that actually compiles the driver.
 #define USE_SSD1306
 
+// Piglet, the pet pig frame (PigPetModule). Set here rather than in platformio.ini: an ini edit
+// changes the project checksum and PlatformIO then wipes every environment's build directory.
+#define PIG_PET
+
 #define I2C_SDA 5
 #define I2C_SCL 6
 

@@ -23,6 +23,7 @@
 #include "modules/games/GamesModule.h"
 #endif
 #include "modules/SpectrumModule.h"
+#include "modules/PigPetModule.h"
 #if !MESHTASTIC_EXCLUDE_DETECTIONSENSOR
 #include "modules/DetectionSensorModule.h"
 #endif
@@ -226,6 +227,11 @@ void setupModules()
 #if HAS_SCREEN && defined(SPECTRUM_ANALYZER)
     if (config.display.displaymode != meshtastic_Config_DisplayConfig_DisplayMode_COLOR) {
         spectrumModule = new SpectrumModule();
+    }
+#endif
+#if HAS_SCREEN && defined(PIG_PET)
+    if (config.display.displaymode != meshtastic_Config_DisplayConfig_DisplayMode_COLOR) {
+        pigPetModule = new PigPetModule();
     }
 #endif
 #if ARCH_PORTDUINO
