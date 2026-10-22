@@ -1,0 +1,16 @@
+{
+  "name": "Meshtastic Piglet (XIAO ESP32-S3 DIY)",
+  "version": "2.8.1.9d8d166",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        {
+          "path": "bins/firmware-seeed-xiao-s3-diy-2.8.1.9d8d166.factory.bin",
+          "offset": 0
+        }
+      ]
+    }
+  ]
+}

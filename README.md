@@ -48,6 +48,7 @@ image gives a garbled, mirrored or blank screen.
 | ST7789 | `bins/firmware-lcdwiki_2_8_e22_st7789-*.factory.bin` |
 | LCDWIKI 3.5" (ST7796) | `bins/firmware-lcdwiki_3_5_e22-*.factory.bin` |
 | Heltec V3 (ESP32-S3) | `bins/firmware-heltec-v3-spectrum-*.factory.bin` — flash with `--chip esp32s3 --flash-size 8MB` |
+| Piglet: XIAO ESP32-S3 DIY | `bins/firmware-seeed-xiao-s3-diy-*.factory.bin` — `--chip esp32s3 --flash-size 8MB`; wiring below |
 
 ```bash
 pip install esptool
@@ -90,6 +91,30 @@ Three of these matter more than they look:
 
 Full pinout, including display and touch, is in the
 [variant README](../../blob/lcdwiki-2.8-e22/variants/esp32/lcdwiki_2_8_e22/README.md).
+
+## Piglet (XIAO ESP32-S3 DIY)
+
+A Piglet wardriver turned into a Meshtastic node, with a pet pig on his own
+screen. He gets hungry over a few hours, cheers up when the mesh is busy and
+dances when a message arrives, gets fitter when you carry him (GPS distance),
+sleeps at night, and plays fetch: a telemetry request or traceroute to a
+nearby node, at most one every five minutes, with a twerk when it comes back.
+Short press moves between screens; a long press on his screen opens his menu
+(Feed, Play fetch, Fetch: trace route, Put to bed, Stats, Rename).
+
+| Part | XIAO pin (GPIO) |
+|---|---|
+| Wio-SX1262 SCK / MISO / MOSI | D8 (7) / D9 (8) / D10 (9) |
+| Wio-SX1262 NSS | GPIO43 (rerouted from the board's GPS-TX pad) |
+| Wio-SX1262 RESET / DIO1 / BUSY | D2 (3) / D1 (2) / D3 (4) |
+| 0.96" SSD1306 OLED SDA / SCL | D4 (5) / D5 (6) |
+| L76K GPS TX → XIAO | D7 (44); receive-only, nothing to the GPS RX |
+| Button | D0 (1) to GND |
+
+The antenna switch is driven by the SX1262's DIO2; there is no battery sense.
+The pig is inspired by the Piglet wardriver's walking pig and drawn from scratch
+for this firmware. The image reports version `2.8.1.9d8d166`; its source is
+commit `3f959ae` on `lcdwiki-2.8.1` (`9d8d166` plus the Piglet frame).
 
 ## Maps
 

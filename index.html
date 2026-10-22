@@ -35,7 +35,7 @@
 <body>
 <main>
   <h1>Meshtastic CYD — Web Flasher</h1>
-  <p class="sub">Flash the LCDWIKI CYD + E22 builds (and a Heltec V3 spectrum build) straight from your browser.
+  <p class="sub">Flash the LCDWIKI CYD + E22 builds, a Heltec V3 spectrum build and the Piglet XIAO node straight from your browser.
      Use <b>Chrome</b> or <b>Edge</b> on desktop — Web Serial isn't available in Firefox or Safari.</p>
 
   <div class="card">
@@ -63,6 +63,15 @@
     <p>Stock Heltec WiFi LoRa 32 V3 with the on-device spectrum analyzer (LoRa Actions → Spectrum)
        and Radio Tuning added. Its bare SX1262 reads close to true dBm, so it makes a good measuring receiver.</p>
     <esp-web-install-button manifest="manifest-heltec-v3.json"></esp-web-install-button>
+  </div>
+
+  <div class="card">
+    <h2>Piglet (XIAO ESP32-S3 DIY)</h2>
+    <p>A Piglet wardriver repurposed as a Meshtastic node: XIAO ESP32-S3 + Wio-SX1262, 0.96" OLED,
+       receive-only GPS. Comes with Piglet, a pet pig on his own screen who gets hungry, cheers up when
+       the mesh is busy, gets fitter when you walk him and plays fetch with nearby nodes.
+       Long-press on his screen for his menu. Needs the wiring in the README.</p>
+    <esp-web-install-button manifest="manifest-piglet.json"></esp-web-install-button>
   </div>
 
   <div class="card warn">
