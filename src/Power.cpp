@@ -1906,6 +1906,17 @@ bool Power::max17048Init()
 }
 #endif
 
+void Power::lateFuelGaugeInit()
+{
+    // setup() runs before the I2C scan, so a MAX17048 is not in the sensor map yet when it is
+    // probed there and the ADC divider wins. Once the scan has registered the gauge, switch the
+    // battery source over - but only away from the ADC fallback, never from a PMU or charger.
+    if (batteryLevel != nullptr && batteryLevel != &analogLevel)
+        return;
+    if (max17048Init())
+        LOG_INFO("Power: battery level now read from the MAX17048");
+}
+
 #if !MESHTASTIC_EXCLUDE_I2C && HAS_CW2015
 
 class CW2015BatteryLevel : public AnalogBatteryLevel

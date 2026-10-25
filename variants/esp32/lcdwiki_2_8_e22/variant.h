@@ -21,8 +21,14 @@
 // Hardware notes:
 // - No PSRAM, 320KB RAM, 4MB flash -> see platformio.ini for feature exclusions.
 // - Base UI only (not MUI).
-// - GPIO21 is the LCD backlight. I2C is deliberately NOT defined: I2C_SDA would
-//   also claim GPIO21 and whichever initialised second would break the other.
+// - GPIO21 is the LCD backlight, so I2C must not use the ESP32 default SDA 21 / SCL 22
+//   (22 is also the E22 reset). I2C is on the only two free output-capable pins instead.
+
+// I2C: a MAX17048 fuel gauge (Mesh 2.1 board) or other sensors. GPIO16 is the RGB LED's green
+// channel (it may flicker with bus traffic) and GPIO26 the speaker-amp input; both have to be
+// tapped on the board. The MAX17048 is found by the I2C scan and becomes the battery source.
+#define I2C_SDA 16
+#define I2C_SCL 26
 
 // Button
 #define BUTTON_PIN 0 // GPIO 0, pulled low to activate
@@ -43,7 +49,8 @@
 
 // NOTE: HAS_WIRE 0 was tried here and caused repeated
 // "Wire.cpp endTransmission(): NULL TX buffer pointer" errors, because the I2C
-// scanner still runs. Left enabled; the theoretical GPIO21 clash never manifested.
+// scanner still runs. Left enabled; with I2C_SDA/I2C_SCL defined above it no longer touches
+// GPIO21/22 at all.
 
 // GPS defaults to GPIO3, which UART0 (the USB serial console) also owns. These are
 // only DEFAULTS: config.position.rx_gpio/tx_gpio are settable from the phone app and
