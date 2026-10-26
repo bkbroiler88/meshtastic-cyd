@@ -113,6 +113,8 @@ class Power : public concurrency::OSThread
 
     void attachPowerInterrupts();
     void detachPowerInterrupts();
+    /// Pick up an I2C fuel gauge found by the I2C scan, which runs after setup()
+    void lateFuelGaugeInit();
 
   protected:
     meshtastic::PowerStatus *statusHandler;
