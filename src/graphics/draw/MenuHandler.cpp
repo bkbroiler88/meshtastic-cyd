@@ -51,6 +51,13 @@
 #include "modules/WaypointModule.h"
 #if !MESHTASTIC_EXCLUDE_WAYPOINT
 #include "WaypointStore.h"
+#ifdef LCDWIKI_EXTRAS
+#include "FSCommon.h"
+#include "SPILock.h"
+#include "SafeFile.h"
+#include "TypeConversions.h"
+#include "concurrency/LockGuard.h"
+#endif
 #endif
 #include <algorithm>
 #include <array>
@@ -507,16 +514,225 @@ static void saveOwnerName(const String &text, bool shortName)
 }
 #endif
 
+// --- Hiker / Router modes ----------------------------------------------------------------
+// Router: a well-placed relay. Router role, Bluetooth off, screen times out, position sent
+// rarely. The GPS keeps running on a long update interval - it is also what sets the clock.
+// Hiker: everything as it was before Router mode, kept in a small snapshot file.
+namespace
+{
+struct HikerSnapshot {
+    uint32_t magic;
+    uint8_t role, rebroadcastMode;
+    uint8_t smartBroadcast, bluetooth, fixedPosition, unmessagable, hasUnmessagable, reserved;
+    uint32_t gpsUpdateInterval, positionBroadcastSecs, screenOnSecs, telemetryInterval;
+};
+constexpr uint32_t kHikerMagic = 0x484b5231; // "HKR1"
+constexpr const char *kHikerPath = "/prefs/hikermode";
+constexpr uint32_t kRouterGpsIntervalS = 60 * 60;          // GPS still runs: hourly keeps the clock true
+constexpr uint32_t kRouterPositionSecs = 12 * 60 * 60;     // a router does not move
+constexpr uint32_t kRouterScreenOnSecs = 15;
+
+bool isRouterRole()
+{
+    return config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER ||
+           config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE;
+}
+
+void saveHikerSnapshot()
+{
+#ifdef FSCom
+    HikerSnapshot s = {};
+    s.magic = kHikerMagic;
+    s.role = (uint8_t)config.device.role;
+    s.rebroadcastMode = (uint8_t)config.device.rebroadcast_mode;
+    s.smartBroadcast = config.position.position_broadcast_smart_enabled;
+    s.bluetooth = config.bluetooth.enabled;
+    s.fixedPosition = config.position.fixed_position;
+    s.unmessagable = owner.is_unmessagable;
+    s.hasUnmessagable = owner.has_is_unmessagable;
+    s.gpsUpdateInterval = config.position.gps_update_interval;
+    s.positionBroadcastSecs = config.position.position_broadcast_secs;
+    s.screenOnSecs = config.display.screen_on_secs;
+    s.telemetryInterval = moduleConfig.telemetry.device_update_interval;
+    {
+        concurrency::LockGuard g(spiLock);
+        FSCom.mkdir("/prefs");
+    }
+    auto sf = SafeFile(kHikerPath, true);
+    sf.write(reinterpret_cast<uint8_t *>(&s), sizeof(s));
+    sf.close();
+#endif
+}
+
+bool loadHikerSnapshot(HikerSnapshot &s)
+{
+#ifdef FSCom
+    concurrency::LockGuard g(spiLock);
+    auto f = FSCom.open(kHikerPath, FILE_O_READ);
+    if (!f)
+        return false;
+    const bool ok = f.read(reinterpret_cast<uint8_t *>(&s), sizeof(s)) == sizeof(s);
+    f.close();
+    return ok && s.magic == kHikerMagic;
+#else
+    return false;
+#endif
+}
+
+void saveAndReboot(const char *msg)
+{
+    nodeDB->saveToDisk(SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_NODEDATABASE);
+    screen->showSimpleBanner(msg, 0); // stays up until the reboot
+    rebootAtMsec = Time::timerEndsAtMillis(3000);
+}
+
+void applyRouterMode(meshtastic_Config_DeviceConfig_Role role, bool fixHere)
+{
+    if (!isRouterRole())
+        saveHikerSnapshot(); // only when leaving Hiker, so Router -> Router keeps the original
+    config.device.role = role;
+    nodeDB->installRoleDefaults(role); // the role's own intervals and owner flags first
+    if (config.device.rebroadcast_mode == meshtastic_Config_DeviceConfig_RebroadcastMode_NONE)
+        config.device.rebroadcast_mode = meshtastic_Config_DeviceConfig_RebroadcastMode_ALL;
+    config.position.gps_update_interval = kRouterGpsIntervalS;
+    config.position.position_broadcast_secs = kRouterPositionSecs;
+    config.position.position_broadcast_smart_enabled = false;
+    config.bluetooth.enabled = false;
+    config.display.screen_on_secs = kRouterScreenOnSecs;
+    if (fixHere) {
+        meshtastic_PositionLite lite;
+        if (nodeDB->copyNodePosition(nodeDB->getNodeNum(), lite) && (lite.latitude_i || lite.longitude_i)) {
+            meshtastic_Position p = TypeConversions::ConvertToPosition(lite);
+            nodeDB->updatePosition(nodeDB->getNodeNum(), p, RX_SRC_LOCAL);
+            nodeDB->setLocalPosition(p);
+            config.position.fixed_position = true;
+        }
+    }
+    saveAndReboot(role == meshtastic_Config_DeviceConfig_Role_ROUTER ? "Router mode: rebooting" : "Router Late mode: rebooting");
+}
+
+void applyHikerMode()
+{
+    HikerSnapshot s;
+    if (!loadHikerSnapshot(s)) {
+        s = {};
+        s.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+        s.rebroadcastMode = meshtastic_Config_DeviceConfig_RebroadcastMode_ALL;
+        s.smartBroadcast = true;
+        s.bluetooth = true;
+        s.gpsUpdateInterval = 2 * 60;
+        s.positionBroadcastSecs = 60 * 60;
+        s.telemetryInterval = 60 * 60;
+    }
+    config.device.role = (meshtastic_Config_DeviceConfig_Role)s.role;
+    config.device.rebroadcast_mode = (meshtastic_Config_DeviceConfig_RebroadcastMode)s.rebroadcastMode;
+    config.position.position_broadcast_smart_enabled = s.smartBroadcast;
+    config.bluetooth.enabled = s.bluetooth;
+    config.position.gps_update_interval = s.gpsUpdateInterval;
+    config.position.position_broadcast_secs = s.positionBroadcastSecs;
+    config.display.screen_on_secs = s.screenOnSecs;
+    moduleConfig.telemetry.device_update_interval = s.telemetryInterval;
+    owner.has_is_unmessagable = s.hasUnmessagable;
+    owner.is_unmessagable = s.unmessagable;
+    if (!s.fixedPosition && config.position.fixed_position) {
+        nodeDB->clearLocalPosition();
+        config.position.fixed_position = false;
+    }
+    saveAndReboot("Hiker mode: rebooting");
+}
+
+meshtastic_Config_DeviceConfig_Role pendingRouterRole = meshtastic_Config_DeviceConfig_Role_ROUTER;
+} // namespace
+
+void menuHandler::nodeModeMenu()
+{
+    static const char *optionsArray[] = {"Back", "Hiker", "Router", "Router Late"};
+    enum { Back = 0, Hiker, Router, RouterLate };
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "Mode";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 4;
+    bannerOptions.InitialSelected = config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER        ? Router
+                                    : config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE ? RouterLate
+                                                                                                             : Hiker;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected == Hiker) {
+            if (isRouterRole())
+                applyHikerMode();
+        } else if (selected == Router || selected == RouterLate) {
+            pendingRouterRole = selected == Router ? meshtastic_Config_DeviceConfig_Role_ROUTER
+                                                   : meshtastic_Config_DeviceConfig_Role_ROUTER_LATE;
+            menuHandler::menuQueue = menuHandler::RouterFixedMenu;
+            screen->runNow();
+        }
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+
+// A placed router should broadcast where it actually is, not a slightly wandering fix
+void menuHandler::routerFixedMenu()
+{
+    static const char *optionsArray[] = {"Back", "Fix position here", "Keep using GPS"};
+    enum { Back = 0, FixHere, KeepGps };
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "Router position";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 3;
+    bannerOptions.InitialSelected = FixHere;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected == FixHere || selected == KeepGps)
+            applyRouterMode(pendingRouterRole, selected == FixHere);
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+
+void menuHandler::restoreConfirmMenu()
+{
+    showConfirmationBanner("Restore settings, channels\nand keys from SD? Reboots.", []() {
+        if (nodeDB->restorePreferences(meshtastic_AdminMessage_BackupLocation_SD,
+                                       SEGMENT_DEVICESTATE | SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_CHANNELS)) {
+            screen->showSimpleBanner("Restored: rebooting", 0);
+            rebootAtMsec = Time::timerEndsAtMillis(3000);
+        } else {
+            screen->showSimpleBanner(config.bluetooth.enabled ? "SD needs Bluetooth off" : "No backup on the SD card", 3000);
+        }
+    });
+}
+
 // System > Settings: on-device settings that otherwise need the app or the CLI.
 void menuHandler::settingsMenu()
 {
-    static const char *optionsArray[] = {"Back", "Long Name", "Short Name"};
-    enum optionsNumbers { Back = 0, LongName, ShortName };
+    static char modeLine[24];
+    snprintf(modeLine, sizeof(modeLine), "Mode: %s",
+             config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER        ? "Router"
+             : config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE ? "Router Late"
+                                                                                      : "Hiker");
+    static const char *optionsArray[] = {"Back", "Long Name", "Short Name", modeLine, "Backup to SD", "Restore from SD"};
+    enum optionsNumbers { Back = 0, LongName, ShortName, Mode, BackupSd, RestoreSd };
     BannerOverlayOptions bannerOptions;
     bannerOptions.message = "Settings";
     bannerOptions.optionsArrayPtr = optionsArray;
-    bannerOptions.optionsCount = 3;
+    bannerOptions.optionsCount = 6;
     bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected == Mode) {
+            menuHandler::menuQueue = menuHandler::NodeModeMenu;
+            screen->runNow();
+            return;
+        }
+        if (selected == BackupSd) {
+            if (config.bluetooth.enabled)
+                screen->showSimpleBanner("SD needs Bluetooth off", 3000);
+            else if (nodeDB->backupPreferences(meshtastic_AdminMessage_BackupLocation_SD))
+                screen->showSimpleBanner("Saved to SD:\n/meshtastic/backup.proto", 3000);
+            else
+                screen->showSimpleBanner("Backup failed: no SD card?", 3000);
+            return;
+        }
+        if (selected == RestoreSd) {
+            menuHandler::menuQueue = menuHandler::RestoreConfirmMenu;
+            screen->runNow();
+            return;
+        }
 #if HAS_COLOR_KEYBOARD && !MESHTASTIC_EXCLUDE_CANNEDMESSAGES
         if (!cannedMessageModule)
             return;
@@ -3755,6 +3971,15 @@ void menuHandler::handleMenuSwitch(OLEDDisplay *display)
         break;
     case NodeDetailMenu:
         nodeDetailMenu();
+        break;
+    case NodeModeMenu:
+        nodeModeMenu();
+        break;
+    case RouterFixedMenu:
+        routerFixedMenu();
+        break;
+    case RestoreConfirmMenu:
+        restoreConfirmMenu();
         break;
 #endif
     case FrequencySlot:

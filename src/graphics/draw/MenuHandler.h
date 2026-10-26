@@ -82,6 +82,9 @@ class menuHandler
         HopLimitPicker,
         SettingsMenu,
         NodeDetailMenu,
+        NodeModeMenu,
+        RouterFixedMenu,
+        RestoreConfirmMenu,
 #endif
 #if HAS_LORA_FEM
         LoraFemLnaToggleMenu
@@ -113,6 +116,9 @@ class menuHandler
     static void hopLimitPicker();
     static void settingsMenu();
     static void nodeDetailMenu();
+    static void nodeModeMenu();
+    static void routerFixedMenu();
+    static void restoreConfirmMenu();
 #endif
     static void FrequencySlotPicker();
     static void handleMenuSwitch(OLEDDisplay *display);

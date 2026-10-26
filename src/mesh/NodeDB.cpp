@@ -4766,23 +4766,44 @@ bool NodeDB::ensurePkiIdentity()
 #endif
 }
 
+#if defined(HAS_SDCARD) && !defined(SDCARD_USE_SOFT_SPI)
+#include <SD.h>
+#define NODEDB_SD_BACKUP 1
+// On the card, so it survives the full-flash erase a web-flasher install does
+static constexpr const char *sdBackupDir = "/meshtastic";
+static constexpr const char *sdBackupFileName = "/meshtastic/backup.proto";
+static constexpr const char *sdBackupTmpName = "/meshtastic/backup.tmp";
+
+static bool sdCardPresent()
+{
+    concurrency::LockGuard g(spiLock);
+    return SD.cardType() != CARD_NONE;
+}
+#endif
+
+static void fillBackup(meshtastic_BackupPreferences &backup)
+{
+    backup = meshtastic_BackupPreferences_init_zero;
+    backup.version = DEVICESTATE_CUR_VER;
+    backup.timestamp = getValidTime(RTCQuality::RTCQualityDevice, false);
+    backup.has_config = true;
+    backup.config = config;
+    backup.has_module_config = true;
+    backup.module_config = moduleConfig;
+    backup.has_channels = true;
+    backup.channels = channelFile;
+    backup.has_owner = true;
+    backup.owner = owner;
+}
+
 bool NodeDB::backupPreferences(meshtastic_AdminMessage_BackupLocation location)
 {
     bool success = false;
     lastBackupAttempt = millis();
 #ifdef FSCom
     if (location == meshtastic_AdminMessage_BackupLocation_FLASH) {
-        meshtastic_BackupPreferences backup = meshtastic_BackupPreferences_init_zero;
-        backup.version = DEVICESTATE_CUR_VER;
-        backup.timestamp = getValidTime(RTCQuality::RTCQualityDevice, false);
-        backup.has_config = true;
-        backup.config = config;
-        backup.has_module_config = true;
-        backup.module_config = moduleConfig;
-        backup.has_channels = true;
-        backup.channels = channelFile;
-        backup.has_owner = true;
-        backup.owner = owner;
+        meshtastic_BackupPreferences backup;
+        fillBackup(backup);
 
         size_t backupSize;
         pb_get_encoded_size(&backupSize, meshtastic_BackupPreferences_fields, &backup);
@@ -4798,7 +4819,39 @@ bool NodeDB::backupPreferences(meshtastic_AdminMessage_BackupLocation location)
             LOG_ERROR("Save backup prefs to file failed");
         }
     } else if (location == meshtastic_AdminMessage_BackupLocation_SD) {
-        // TODO: After more mainline SD card support
+#ifdef NODEDB_SD_BACKUP
+        if (!sdCardPresent()) {
+            LOG_WARN("Backup to SD: no card mounted");
+            return false;
+        }
+        // Heap, not stack: the message is several KB and this can run from the UI thread
+        auto *backup = new meshtastic_BackupPreferences;
+        uint8_t *buf = (uint8_t *)malloc(meshtastic_BackupPreferences_size);
+        if (backup && buf) {
+            fillBackup(*backup);
+            pb_ostream_t os = pb_ostream_from_buffer(buf, meshtastic_BackupPreferences_size);
+            if (pb_encode(&os, meshtastic_BackupPreferences_fields, backup)) {
+                // Write a temp file and swap it in, so a pulled card never leaves half a backup
+                concurrency::LockGuard g(spiLock);
+                SD.mkdir(sdBackupDir);
+                File f = SD.open(sdBackupTmpName, FILE_WRITE);
+                if (f) {
+                    const size_t written = f.write(buf, os.bytes_written);
+                    f.close();
+                    if (written == os.bytes_written) {
+                        SD.remove(sdBackupFileName);
+                        success = SD.rename(sdBackupTmpName, sdBackupFileName);
+                    }
+                }
+            }
+        }
+        free(buf);
+        delete backup;
+        if (success)
+            LOG_INFO("Saved backup preferences to SD %s", sdBackupFileName);
+        else
+            LOG_ERROR("Save backup prefs to SD failed");
+#endif
     }
 #endif
     return success;
@@ -4808,18 +4861,50 @@ bool NodeDB::restorePreferences(meshtastic_AdminMessage_BackupLocation location,
 {
     bool success = false;
 #ifdef FSCom
+    // Heap, not stack: the message is several KB
+    auto *backupPtr = new meshtastic_BackupPreferences;
+    if (!backupPtr)
+        return false;
+    *backupPtr = meshtastic_BackupPreferences_init_zero;
+    meshtastic_BackupPreferences &backup = *backupPtr;
     if (location == meshtastic_AdminMessage_BackupLocation_FLASH) {
         spiLock->lock();
         if (!FSCom.exists(backupFileName)) {
             spiLock->unlock();
             LOG_WARN("Can't restore, no backup file");
+            delete backupPtr;
             return false;
         } else {
             spiLock->unlock();
         }
-        meshtastic_BackupPreferences backup = meshtastic_BackupPreferences_init_zero;
         success = loadProto(backupFileName, meshtastic_BackupPreferences_size, sizeof(meshtastic_BackupPreferences),
                             &meshtastic_BackupPreferences_msg, &backup);
+    } else if (location == meshtastic_AdminMessage_BackupLocation_SD) {
+#ifdef NODEDB_SD_BACKUP
+        if (sdCardPresent()) {
+            uint8_t *buf = (uint8_t *)malloc(meshtastic_BackupPreferences_size);
+            size_t n = 0;
+            if (buf) {
+                concurrency::LockGuard g(spiLock);
+                File f = SD.open(sdBackupFileName, FILE_READ);
+                if (f) {
+                    n = f.read(buf, meshtastic_BackupPreferences_size);
+                    f.close();
+                }
+            }
+            if (n > 0) {
+                pb_istream_t is = pb_istream_from_buffer(buf, n);
+                success = pb_decode(&is, meshtastic_BackupPreferences_fields, &backup);
+            }
+            free(buf);
+            if (!success)
+                LOG_WARN("Can't restore, no readable backup on SD at %s", sdBackupFileName);
+        } else {
+            LOG_WARN("Restore from SD: no card mounted");
+        }
+#endif
+    }
+    {
         if (success) {
             if (restoreWhat & SEGMENT_CONFIG) {
                 config = backup.config;
@@ -4858,9 +4943,8 @@ bool NodeDB::restorePreferences(meshtastic_AdminMessage_BackupLocation location,
         } else {
             LOG_ERROR("Restore prefs from backup failed");
         }
-    } else if (location == meshtastic_AdminMessage_BackupLocation_SD) {
-        // TODO: After more mainline SD card support
     }
+    delete backupPtr;
 #endif
     return success;
 }
