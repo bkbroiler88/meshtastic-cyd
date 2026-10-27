@@ -85,6 +85,8 @@ class menuHandler
         NodeModeMenu,
         RouterFixedMenu,
         RestoreConfirmMenu,
+        SiteCheckMenu,
+        BatteryMenu,
 #endif
 #if HAS_LORA_FEM
         LoraFemLnaToggleMenu
@@ -119,6 +121,8 @@ class menuHandler
     static void nodeModeMenu();
     static void routerFixedMenu();
     static void restoreConfirmMenu();
+    static void siteCheckMenu();
+    static void batteryMenu();
 #endif
     static void FrequencySlotPicker();
     static void handleMenuSwitch(OLEDDisplay *display);

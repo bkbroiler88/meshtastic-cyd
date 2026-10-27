@@ -55,8 +55,17 @@
 #include "FSCommon.h"
 #include "SPILock.h"
 #include "SafeFile.h"
+#include "PowerStatus.h"
 #include "TypeConversions.h"
+#include "airtime.h"
 #include "concurrency/LockGuard.h"
+#if !MESHTASTIC_EXCLUDE_I2C && __has_include(<Adafruit_MAX1704X.h>)
+#include "modules/Telemetry/Sensor/MAX17048Sensor.h"
+#define LCDWIKI_HAS_GAUGE_RATE 1
+// TelemetrySensor.h only declares this when the environment/air-quality modules are built; main.cpp
+// defines it whenever I2C is, which the 2.8" relies on (it excludes the environment module).
+extern std::pair<uint8_t, TwoWire *> nodeTelemetrySensorsMap[_meshtastic_TelemetrySensorType_MAX + 1];
+#endif
 #endif
 #endif
 #include <algorithm>
@@ -697,6 +706,154 @@ void menuHandler::restoreConfirmMenu()
             screen->showSimpleBanner(config.bluetooth.enabled ? "SD needs Bluetooth off" : "No backup on the SD card", 3000);
         }
     });
+}
+
+// System > Site Check: is this a good place to leave a router? Who it hears directly and how
+// well, how busy the channel is, and the noise floor. Refresh re-reads everything.
+void menuHandler::siteCheckMenu()
+{
+    static char message[320];
+    size_t len = 0;
+    auto line = [&](const char *text) {
+        if (len < sizeof(message) - 1)
+            len += snprintf(message + len, sizeof(message) - len, "%s%s", len ? "\n" : "", text);
+    };
+    char buf[64];
+
+    // Nodes heard in the last 15 minutes (all heard nodes if the clock is not set yet)
+    constexpr uint32_t kWindowS = 15 * 60;
+    const uint32_t now = getTime();
+    const bool timeKnown = now > 1600000000;
+    const NodeNum me = nodeDB->getNodeNum();
+    struct Best {
+        NodeNum num;
+        float snr;
+        uint32_t ago;
+    } best[4] = {};
+    uint8_t nBest = 0;
+    unsigned heard = 0, direct = 0;
+    for (size_t i = 0; i < nodeDB->getNumMeshNodes(); i++) {
+        const meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
+        if (!n || n->num == me || !n->last_heard)
+            continue;
+        if (timeKnown && (now < n->last_heard || now - n->last_heard > kWindowS))
+            continue;
+        heard++;
+        if (!(n->has_hops_away && n->hops_away == 0))
+            continue;
+        direct++;
+        const float snr = n->snr != 0.0f ? n->snr : n->snr_q4 / 4.0f;
+        const uint32_t ago = (timeKnown && now >= n->last_heard) ? now - n->last_heard : 0;
+        // keep the four strongest direct neighbours, best first
+        uint8_t at = nBest < 4 ? nBest++ : 4;
+        while (at > 0 && best[at - 1].snr < snr) {
+            if (at < 4)
+                best[at] = best[at - 1];
+            at--;
+        }
+        if (at < 4)
+            best[at] = {n->num, snr, ago};
+    }
+
+    const float bestSnr = nBest ? best[0].snr : -99.0f;
+    const char *verdict = !heard                         ? "Poor: hears no one"
+                          : !direct                      ? "Poor: no direct nodes"
+                          : (direct >= 3 && bestSnr >= 0) ? "Good spot"
+                                                         : "Fair spot";
+    line(verdict);
+    snprintf(buf, sizeof(buf), "%u heard, %u direct (%s)", heard, direct, timeKnown ? "15 min" : "all");
+    line(buf);
+    for (uint8_t i = 0; i < nBest; i++) {
+        const meshtastic_NodeInfoLite *n = nodeDB->getMeshNode(best[i].num);
+        const char *name = (n && n->short_name[0]) ? n->short_name : "????";
+        if (best[i].ago)
+            snprintf(buf, sizeof(buf), " %-4s SNR %5.1f  %lum", name, best[i].snr, (unsigned long)(best[i].ago / 60));
+        else
+            snprintf(buf, sizeof(buf), " %-4s SNR %5.1f", name, best[i].snr);
+        line(buf);
+    }
+    if (airTime) {
+        snprintf(buf, sizeof(buf), "Channel busy %.0f%%, our TX %.1f%%", airTime->channelUtilizationPercent(),
+                 airTime->utilizationTXPercent());
+        line(buf);
+    }
+    if (RadioLibInterface::instance) {
+        snprintf(buf, sizeof(buf), "Noise floor %ld dBm", (long)RadioLibInterface::instance->getNoiseFloor());
+        line(buf);
+    }
+
+    static const char *optionsArray[] = {"Back", "Refresh"};
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = message;
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 2;
+    bannerOptions.InitialSelected = 1;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected == 1) {
+            menuHandler::menuQueue = menuHandler::SiteCheckMenu;
+            screen->runNow();
+        }
+    };
+    screen->showOverlayBanner(bannerOptions);
+}
+
+// System > Battery: charge, voltage, and - with a MAX17048 fuel gauge - time left or to full
+// from the gauge's measured charge rate.
+void menuHandler::batteryMenu()
+{
+    static char message[200];
+    size_t len = 0;
+    auto line = [&](const char *text) {
+        if (len < sizeof(message) - 1)
+            len += snprintf(message + len, sizeof(message) - len, "%s%s", len ? "\n" : "", text);
+    };
+    char buf[64];
+
+    if (!powerStatus || !powerStatus->getHasBattery()) {
+        line("No battery reading");
+    } else {
+        const unsigned pct = powerStatus->getBatteryChargePercent();
+        const int mv = powerStatus->getBatteryVoltageMv();
+        snprintf(buf, sizeof(buf), "%u%%  %d.%02d V", pct, mv / 1000, (mv % 1000) / 10);
+        line(buf);
+        line(powerStatus->getIsCharging() ? "Charging" : powerStatus->getHasUSB() ? "External power" : "On battery");
+#ifdef LCDWIKI_HAS_GAUGE_RATE
+        if (nodeTelemetrySensorsMap[meshtastic_TelemetrySensorType_MAX17048].first != 0) {
+            const float rate = MAX17048Singleton::GetInstance()->chargeRate(); // % per hour, + charging
+            auto hm = [](float hours, char *out, size_t n) {
+                const unsigned long mins = (unsigned long)(hours * 60.0f + 0.5f);
+                snprintf(out, n, "%luh %02lum", mins / 60, mins % 60);
+            };
+            char t[16];
+            if (rate < -0.2f) {
+                hm(pct / -rate, t, sizeof(t));
+                snprintf(buf, sizeof(buf), "About %s left", t);
+            } else if (rate > 0.2f && pct < 100) {
+                hm((100 - pct) / rate, t, sizeof(t));
+                snprintf(buf, sizeof(buf), "Full in about %s", t);
+            } else {
+                snprintf(buf, sizeof(buf), "Rate settling...");
+            }
+            line(buf);
+            snprintf(buf, sizeof(buf), "Rate %+.1f%%/h (gauge)", rate);
+            line(buf);
+        }
+#endif
+    }
+
+    static const char *optionsArray[] = {"Back", "Refresh"};
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = message;
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = 2;
+    bannerOptions.InitialSelected = 1;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected == 1) {
+            menuHandler::menuQueue = menuHandler::BatteryMenu;
+            screen->runNow();
+        }
+    };
+    screen->showOverlayBanner(bannerOptions);
 }
 
 // System > Settings: on-device settings that otherwise need the app or the CLI.
@@ -1993,7 +2150,19 @@ void menuHandler::textMessageBaseMenu()
 
 void menuHandler::systemBaseMenu()
 {
-    enum optionsNumbers { Back, Notifications, ScreenOptions, Bluetooth, WiFiToggle, PowerMenu, Test, Settings, enumEnd };
+    enum optionsNumbers {
+        Back,
+        Notifications,
+        ScreenOptions,
+        Bluetooth,
+        WiFiToggle,
+        PowerMenu,
+        Test,
+        Settings,
+        SiteCheck,
+        BatteryInfo,
+        enumEnd
+    };
     static const char *optionsArray[enumEnd] = {"Back"};
     static int optionsEnumArray[enumEnd] = {Back};
     int options = 1;
@@ -2006,6 +2175,10 @@ void menuHandler::systemBaseMenu()
 #ifdef LCDWIKI_EXTRAS
     optionsArray[options] = "Settings";
     optionsEnumArray[options++] = Settings;
+    optionsArray[options] = "Site Check";
+    optionsEnumArray[options++] = SiteCheck;
+    optionsArray[options] = "Battery";
+    optionsEnumArray[options++] = BatteryInfo;
 #endif
 
     if (currentResolution == ScreenResolution::UltraLow) {
@@ -2047,6 +2220,12 @@ void menuHandler::systemBaseMenu()
             menuHandler::menuQueue = menuHandler::ScreenOptionsMenu;
             screen->runNow();
 #ifdef LCDWIKI_EXTRAS
+        } else if (selected == SiteCheck) {
+            menuHandler::menuQueue = menuHandler::SiteCheckMenu;
+            screen->runNow();
+        } else if (selected == BatteryInfo) {
+            menuHandler::menuQueue = menuHandler::BatteryMenu;
+            screen->runNow();
         } else if (selected == Settings) {
             menuHandler::menuQueue = menuHandler::SettingsMenu;
             screen->runNow();
@@ -3981,6 +4160,12 @@ void menuHandler::handleMenuSwitch(OLEDDisplay *display)
         break;
     case RestoreConfirmMenu:
         restoreConfirmMenu();
+        break;
+    case SiteCheckMenu:
+        siteCheckMenu();
+        break;
+    case BatteryMenu:
+        batteryMenu();
         break;
 #endif
     case FrequencySlot:
