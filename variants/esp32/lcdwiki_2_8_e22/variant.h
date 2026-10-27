@@ -101,6 +101,9 @@
 #define TFT_DC 2
 #define TFT_RST -1 // panel reset is tied to EN on this board
 #define TFT_BL 21 // PWM backlight
+// LovyanGFX's Light_PWM owns GPIO21 (LEDC). Keeps TFTDisplay's on/off GpioHwPin off it: its
+// pinMode() on every wake detaches LEDC on core 3.x, leaving the backlight stuck at full.
+#define TFT_BL_LGFX_PWM 1
 
 #define SPI_FREQUENCY 40000000
 #define SPI_READ_FREQUENCY 16000000
@@ -144,6 +147,7 @@
 #define ST7789_CS TFT_CS
 #define ST7789_RESET TFT_RST
 #define ST7789_BUSY TFT_BUSY
+#define ST7789_BL TFT_BL // without this the ST7789 block attaches no backlight and brightness is a no-op
 #else
 #define ILI9341_DRIVER
 #define ILI9341_SPI_HOST HSPI_HOST

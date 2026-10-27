@@ -1685,7 +1685,7 @@ TFTDisplay::TFTDisplay(uint8_t address, int sda, int scl, OLEDDISPLAY_GEOMETRY g
 {
     LOG_DEBUG("TFTDisplay");
 
-#ifdef TFT_BL
+#if defined(TFT_BL) && !defined(TFT_BL_LGFX_PWM) // LGFX PWM boards switch the backlight via setBrightness()
     GpioPin *p = new GpioHwPin(TFT_BL);
 
     if (!TFT_BACKLIGHT_ON) { // Need to invert the pin before hardware
@@ -2253,7 +2253,7 @@ void TFTDisplay::sendCommand(uint8_t com)
         unphone.backlight(true); // using unPhone library
 #endif
 #if defined(RAK14014) || defined(HELTEC_MESH_NODE_T096) || defined(HELTEC_MESH_NODE_T1)
-#elif !defined(M5STACK) && !defined(ST7789_CS) &&                                                                                \
+#elif !defined(M5STACK) && !defined(ST7789_CS) && !defined(TFT_BL_LGFX_PWM) &&                                                   \
     !defined(USE_ARDUINO_GFX) // T-Deck gets brightness set in Screen.cpp in the handleSetOn function
         tft->setBrightness(172);
 #endif

@@ -712,7 +712,7 @@ void Screen::handleSetOn(bool on, FrameCallback einkScreensaver)
             graphics::backlightOn();
 #endif
 
-#if defined(ST7789_CS) &&                                                                                                        \
+#if (defined(ST7789_CS) || defined(TFT_BL_LGFX_PWM)) &&                                                                          \
     !defined(M5STACK) // set display brightness when turning on screens. Just moved function from TFTDisplay to here.
             static_cast<TFTDisplay *>(dispdev)->setDisplayBrightness(brightness);
 #endif
@@ -883,7 +883,7 @@ void Screen::setup()
     ui->getUiState()->userData = this;     // Allow static callbacks to access Screen instance
 
     // Apply loaded brightness
-#if defined(ST7789_CS)
+#if defined(ST7789_CS) || defined(TFT_BL_LGFX_PWM)
     static_cast<TFTDisplay *>(dispdev)->setDisplayBrightness(brightness);
 #elif defined(USE_OLED) || defined(USE_SSD1306) || defined(USE_SH1106) || defined(USE_SH1107) || defined(USE_SPISSD1306)
     dispdev->setBrightness(brightness);

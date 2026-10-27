@@ -145,6 +145,7 @@
 #define ST7796_RESET TFT_RST
 #define ST7796_BUSY TFT_BUSY
 #define ST7796_BL TFT_BL
+#define TFT_BL_LGFX_PWM 1 // see lcdwiki_2_8_e22/variant.h
 
 // Orientation. The two knobs the ILI9341 path actually reads:
 //   TFT_OFFSET_ROTATION - panel-level offset 0~7; 4~7 mirror the X axis.
