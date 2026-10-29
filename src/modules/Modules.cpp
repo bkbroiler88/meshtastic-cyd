@@ -242,7 +242,15 @@ void setupModules()
 #endif
 #if HAS_TELEMETRY && HAS_SENSOR && !MESHTASTIC_EXCLUDE_ENVIRONMENTAL_SENSOR
     if (moduleConfig.has_telemetry &&
-        (moduleConfig.telemetry.environment_measurement_enabled || moduleConfig.telemetry.environment_screen_enabled)) {
+        (moduleConfig.telemetry.environment_measurement_enabled || moduleConfig.telemetry.environment_screen_enabled)
+#if defined(SDCARD_EXCLUSIVE_WITH_BLE_WIFI)
+        // On the DRAM-squeezed LCDWIKI boards the sensor module and a radio cannot both
+        // fit (same bind as the SD card, main.cpp): skip it while Bluetooth or Wi-Fi is up
+        // and reclaim its heap. Read at boot from config, so a radio toggle needs a reboot
+        // to take effect - which the Hiker/Router mode switch already does.
+        && !config.bluetooth.enabled && !config.network.wifi_enabled
+#endif
+    ) {
         environmentTelemetryModule = new EnvironmentTelemetryModule();
     }
 #if HAS_TELEMETRY && HAS_SENSOR && !MESHTASTIC_EXCLUDE_AIR_QUALITY_SENSOR

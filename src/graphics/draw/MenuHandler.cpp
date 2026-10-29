@@ -3931,17 +3931,31 @@ void menuHandler::frameTogglesMenu()
             menuHandler::menuQueue = menuHandler::FrameToggles;
             screen->runNow();
         } else if (selected == show_env_telemetry) {
-            moduleConfig.telemetry.environment_screen_enabled = !moduleConfig.telemetry.environment_screen_enabled;
-            menuHandler::menuQueue = menuHandler::FrameToggles;
-            screen->runNow();
+            // The telemetry module is built once in setupModules() (and on the LCDWIKI boards only
+            // when a radio is off), so flipping the screen flag alone does nothing until reboot and
+            // was never even saved. Enable the whole subsystem - has_telemetry, the measurement flag
+            // so the sensor is actually read, and the screen flag so the frame shows - then persist
+            // and reboot. Turning off clears both flags so the module unloads and frees its heap.
+            const bool on = !moduleConfig.telemetry.environment_screen_enabled;
+            if (on)
+                moduleConfig.has_telemetry = true;
+            moduleConfig.telemetry.environment_measurement_enabled = on;
+            moduleConfig.telemetry.environment_screen_enabled = on;
+            saveAndReboot(on ? "Env telemetry on:\nrebooting" : "Env telemetry off:\nrebooting");
         } else if (selected == show_aq_telemetry) {
-            moduleConfig.telemetry.air_quality_screen_enabled = !moduleConfig.telemetry.air_quality_screen_enabled;
-            menuHandler::menuQueue = menuHandler::FrameToggles;
-            screen->runNow();
+            const bool on = !moduleConfig.telemetry.air_quality_screen_enabled;
+            if (on)
+                moduleConfig.has_telemetry = true;
+            moduleConfig.telemetry.air_quality_enabled = on;
+            moduleConfig.telemetry.air_quality_screen_enabled = on;
+            saveAndReboot(on ? "Air quality on:\nrebooting" : "Air quality off:\nrebooting");
         } else if (selected == show_power) {
-            moduleConfig.telemetry.power_screen_enabled = !moduleConfig.telemetry.power_screen_enabled;
-            menuHandler::menuQueue = menuHandler::FrameToggles;
-            screen->runNow();
+            const bool on = !moduleConfig.telemetry.power_screen_enabled;
+            if (on)
+                moduleConfig.has_telemetry = true;
+            moduleConfig.telemetry.power_measurement_enabled = on;
+            moduleConfig.telemetry.power_screen_enabled = on;
+            saveAndReboot(on ? "Power telemetry on:\nrebooting" : "Power telemetry off:\nrebooting");
         }
     };
     screen->showOverlayBanner(bannerOptions);

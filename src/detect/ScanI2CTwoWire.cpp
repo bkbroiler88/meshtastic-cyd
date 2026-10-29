@@ -692,7 +692,21 @@ void ScanI2CTwoWire::scanPort(I2CPort port, uint8_t *address, uint8_t asize)
 
                 break;
 
-                SCAN_SIMPLE_CASE(SHTC3_ADDR, SHTXX, "SHTXX", (uint8_t)addr.address)
+            case SHTC3_ADDR:
+                // 0x70 is shared. The SHTC3 (Sensirion humidity) lives here, but so does the
+                // QMP6988 barometer - the two halves of an M5 ENV III sit at 0x44 (SHT30) and
+                // 0x70 (QMP6988). The QMP6988 has no firmware driver; branding it SHTXX makes the
+                // environment module bring up an SHT driver against it, deref a bad pointer and
+                // panic (LoadProhibited) in a boot loop the first time the module loads. The
+                // QMP6988 chip-id register (0xD1) reads 0x5C; an SHTC3 does not answer that read
+                // with 0x5C. Only register SHTXX when it is not a QMP6988.
+                if (getRegisterValue(ScanI2CTwoWire::RegisterLocation(addr, 0xD1), 1) == 0x5C) {
+                    LOG_INFO("QMP6988 at 0x%x has no driver; ignoring", (uint8_t)addr.address);
+                } else {
+                    type = SHTXX;
+                    logFoundDevice("SHTXX", (uint8_t)addr.address);
+                }
+                break;
             case RCWL9620_ADDR:
                 // get MAX30102 PARTID
                 registerValue = getRegisterValue(ScanI2CTwoWire::RegisterLocation(addr, 0xFF), 1);

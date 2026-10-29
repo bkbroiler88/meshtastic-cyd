@@ -142,6 +142,14 @@ bool MAX17048Sensor::getMetrics(meshtastic_Telemetry *measurement)
 {
     LOG_TRACE("MAX17048 getMetrics id: %i", measurement->which_variant);
 
+    // The environment module reads this sensor whenever the I2C scan found a MAX17048, but its
+    // runOnce() - which binds max17048 to the singleton - is only compiled when the external
+    // sensor subsystem is enabled. On a build that excludes it (e.g. the LCDWIKI boards, where
+    // the MAX17048 is the battery gauge owned by Power, not an env sensor) this is called without
+    // ever being initialised, so bail instead of dereferencing a null pointer and panicking.
+    if (!max17048)
+        return false;
+
     float volts = max17048->cellVoltage();
     if (isnan(volts)) {
         LOG_DEBUG("MAX17048 getMetrics battery is not connected");
@@ -168,6 +176,8 @@ bool MAX17048Sensor::getMetrics(meshtastic_Telemetry *measurement)
 
 uint16_t MAX17048Sensor::getBusVoltageMv()
 {
+    if (!max17048)
+        return 0;
     return max17048->getBusVoltageMv();
 };
 

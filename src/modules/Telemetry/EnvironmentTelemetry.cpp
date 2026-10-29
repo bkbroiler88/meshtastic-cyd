@@ -128,6 +128,12 @@ extern void drawCommonHeader(OLEDDisplay *display, int16_t x, int16_t y, const c
 #include "Sensor/SPA06Sensor.h"
 #endif
 
+// Also pull SHTXXSensor in outside the EXTERNAL gate above, so it is declared for the
+// registration that runs whenever the environment module is built (see i2cScanFinished).
+#if __has_include(<SHTSensor.h>)
+#include "Sensor/SHTXXSensor.h"
+#endif
+
 #if __has_include(<Adafruit_TSL2561_U.h>)
 #include "Sensor/TSL2561Sensor.h"
 #endif
@@ -149,6 +155,8 @@ extern void drawCommonHeader(OLEDDisplay *display, int16_t x, int16_t y, const c
 
 #include "Sensor/AddI2CSensorTemplate.h"
 #include "graphics/ScreenFonts.h"
+#include "graphics/TFTColorRegions.h"
+#include "graphics/TFTPalette.h"
 #include <Throttle.h>
 
 EnvironmentTelemetryModule *environmentTelemetryModule = nullptr;
@@ -289,6 +297,13 @@ void EnvironmentTelemetryModule::i2cScanFinished(ScanI2C *i2cScanner)
     addSensor<SPA06Sensor>(i2cScanner, ScanI2C::DeviceType::SPA06);
 #endif
 #endif
+    // SHT3x (temp/humidity) is a plain I2C part - keep it available whenever the environment
+    // module is built, instead of only inside the EXTERNAL sensor set below (which also drags in
+    // the INA/weather-station driver bundle). Lets the LCDWIKI boards report an SHT30 on their
+    // own without that cost.
+#if __has_include(<SHTSensor.h>)
+    addSensor<SHTXXSensor>(i2cScanner, ScanI2C::DeviceType::SHTXX);
+#endif
 #endif
 
 #if !MESHTASTIC_EXCLUDE_ENVIRONMENTAL_SENSOR && !MESHTASTIC_EXCLUDE_ENVIRONMENTAL_SENSOR_EXTERNAL
@@ -364,10 +379,8 @@ void EnvironmentTelemetryModule::i2cScanFinished(ScanI2C *i2cScanner)
     addSensor<ADS1X15Sensor>(i2cScanner, ScanI2C::DeviceType::ADS1X15);
     addSensor<ADS1X15Sensor>(i2cScanner, ScanI2C::DeviceType::ADS1X15_ALT);
 #endif
-#if __has_include(<SHTSensor.h>)
-    // TODO Can we scan for multiple sensors connected on the same bus?
-    addSensor<SHTXXSensor>(i2cScanner, ScanI2C::DeviceType::SHTXX);
-#endif
+    // SHTXX is registered above, outside the EXTERNAL gate, so an SHT30 works on boards that
+    // exclude the external sensor set.
 #if __has_include(<Adafruit_DS248x.h>)
     addSensor<DS248XSensor>(i2cScanner, ScanI2C::DeviceType::DS248X);
 #endif
@@ -545,37 +558,102 @@ void EnvironmentTelemetryModule::drawFrame(OLEDDisplay *display, OLEDDisplayUiSt
         return;
     }
 
-    // === First line: Show sender name + time since received (left), and first metric (right) ===
+    // Who/when - shown small in the footer row, not the hero.
     const bool isLocalTelemetry = (getFrom(lastMeasurementPacket) == nodeDB->getNodeNum());
-    const char *sender = isLocalTelemetry ? "Local Sensor" : getSenderShortName(*lastMeasurementPacket);
-    String leftStr = String(sender);
+    const char *sender = isLocalTelemetry ? "Local sensor" : getSenderShortName(*lastMeasurementPacket);
+    String whenStr;
     if (!isLocalTelemetry) {
         uint32_t agoSecs = service->GetTimeSinceMeshPacket(lastMeasurementPacket);
-        String agoStr = (agoSecs > 864000) ? "?"
-                        : (agoSecs > 3600) ? String(agoSecs / 3600) + "h"
-                        : (agoSecs > 60)   ? String(agoSecs / 60) + "m"
-                                           : String(agoSecs) + "s";
-        leftStr += " (" + agoStr + ")";
+        whenStr = (agoSecs > 864000) ? "?"
+                  : (agoSecs > 3600)  ? String(agoSecs / 3600) + "h ago"
+                  : (agoSecs > 60)    ? String(agoSecs / 60) + "m ago"
+                                      : String(agoSecs) + "s ago";
     }
-    display->drawString(x, currentY, leftStr); // Left side: who and when
 
-    // === Collect sensor readings as label strings (no icons) ===
-    std::vector<String> entries;
+    const int16_t w = display->getWidth();
+    const int16_t cx = w / 2;
 
+    // === Temperature hero: big value, tinted by comfort band (always judged in Celsius) ===
     if (m.has_temperature) {
-        String tempStr = moduleConfig.telemetry.environment_display_fahrenheit
-                             ? "Tmp: " + String(UnitConversions::CelsiusToFahrenheit(m.temperature), 1) + "°F"
-                             : "Tmp: " + String(m.temperature, 1) + "°C";
-        entries.push_back(tempStr);
+        // Honour either the phone/CLI Fahrenheit flag or the on-device Display Units menu.
+        const bool useFahrenheit = moduleConfig.telemetry.environment_display_fahrenheit ||
+                                   config.display.units == meshtastic_Config_DisplayConfig_DisplayUnits_IMPERIAL;
+        const float shown = useFahrenheit ? UnitConversions::CelsiusToFahrenheit(m.temperature) : m.temperature;
+        char big[16];
+        snprintf(big, sizeof(big), "%.1f°%c", shown, useFahrenheit ? 'F' : 'C');
+
+        uint16_t comfortColor;
+        const char *comfortWord;
+        if (m.temperature < 5) {
+            comfortColor = graphics::TFTPalette::SkyBlue;
+            comfortWord = "Cold";
+        } else if (m.temperature < 15) {
+            comfortColor = graphics::TFTPalette::Cyan;
+            comfortWord = "Cool";
+        } else if (m.temperature <= 26) {
+            comfortColor = graphics::TFTPalette::Green;
+            comfortWord = "Comfortable";
+        } else if (m.temperature <= 32) {
+            comfortColor = graphics::TFTPalette::Orange;
+            comfortWord = "Warm";
+        } else {
+            comfortColor = graphics::TFTPalette::Red;
+            comfortWord = "Hot";
+        }
+
+        display->setFont(FONT_LARGE);
+        display->setColor(WHITE);
+        display->setTextAlignment(TEXT_ALIGN_CENTER);
+        display->drawString(cx, currentY, big);
+#if GRAPHICS_TFT_COLORING_ENABLED
+        const int16_t bw = display->getStringWidth(big);
+        graphics::registerTFTColorRegionDirect(cx - bw / 2 - 2, currentY, bw + 4, FONT_HEIGHT_LARGE, comfortColor,
+                                               graphics::TFTPalette::Black);
+#endif
+        currentY += FONT_HEIGHT_LARGE + 2;
+
+        display->setFont(FONT_SMALL);
+        display->drawString(cx, currentY, comfortWord);
+        currentY += FONT_HEIGHT_SMALL + 8;
+        display->setTextAlignment(TEXT_ALIGN_LEFT);
     }
-    if (m.has_relative_humidity)
-        entries.push_back("Hum: " + String(m.relative_humidity, 0) + "%");
+
+    // === Humidity: value on the right, a fill bar underneath ===
+    if (m.has_relative_humidity) {
+        int hum = (int)(m.relative_humidity + 0.5f);
+        if (hum < 0)
+            hum = 0;
+        if (hum > 100)
+            hum = 100;
+        char hv[8];
+        snprintf(hv, sizeof(hv), "%d%%", hum);
+        display->setFont(FONT_SMALL);
+        display->setColor(WHITE);
+        display->setTextAlignment(TEXT_ALIGN_LEFT);
+        display->drawString(x + 8, currentY, "Humidity");
+        display->setTextAlignment(TEXT_ALIGN_RIGHT);
+        display->drawString(w - 8, currentY, hv);
+        display->setTextAlignment(TEXT_ALIGN_LEFT);
+        currentY += FONT_HEIGHT_SMALL + 2;
+
+        const int16_t barX = x + 8, barW = w - 16, barH = 8;
+        display->drawRect(barX, currentY, barW, barH);
+        const int16_t fillW = (int16_t)((barW - 2) * hum / 100);
+        if (fillW > 0)
+            display->fillRect(barX + 1, currentY + 1, fillW, barH - 2);
+#if GRAPHICS_TFT_COLORING_ENABLED
+        graphics::registerTFTColorRegionDirect(barX, currentY, barW, barH, graphics::TFTPalette::Blue, graphics::TFTPalette::Black);
+#endif
+        currentY += barH + 8;
+    }
+
+    // === Any remaining metrics (pressure, IAQ, light, power, ...) as compact two-column rows ===
+    std::vector<String> entries;
     if (m.barometric_pressure != 0)
         entries.push_back("Prss: " + String(m.barometric_pressure, 0) + " hPa");
     if (m.has_iaq) {
         String aqi = "IAQ: " + String(m.iaq);
-        const char *bannerMsg = nullptr; // Default: no banner
-
+        const char *bannerMsg = nullptr;
         if (m.iaq <= 25)
             aqi += " (Excellent)";
         else if (m.iaq <= 50)
@@ -594,25 +672,15 @@ void EnvironmentTelemetryModule::drawFrame(OLEDDisplay *display, OLEDDisplayUiSt
             aqi += " (Hazardous)";
             bannerMsg = "Hazardous IAQ";
         }
-
         entries.push_back(aqi);
 
-        // === IAQ alert logic ===
         static uint32_t lastAlertTime = 0;
         uint32_t now = millis();
-
-        bool isOwnTelemetry = isLocalTelemetry;
-        bool isCooldownOver = (now - lastAlertTime > 60000);
-
-        if (isOwnTelemetry && bannerMsg && isCooldownOver) {
+        if (isLocalTelemetry && bannerMsg && (now - lastAlertTime > 60000)) {
             LOG_INFO("drawFrame: IAQ %d (own) - showing banner: %s", m.iaq, bannerMsg);
             screen->showSimpleBanner(bannerMsg, 3000);
-
-            // Only buzz if IAQ is over 200
-            if (m.iaq > 200 && moduleConfig.external_notification.enabled && !externalNotificationModule->getMute()) {
+            if (m.iaq > 200 && moduleConfig.external_notification.enabled && !externalNotificationModule->getMute())
                 playLongBeep();
-            }
-
             lastAlertTime = now;
         }
     }
@@ -629,30 +697,27 @@ void EnvironmentTelemetryModule::drawFrame(OLEDDisplay *display, OLEDDisplayUiSt
     if (m.radiation != 0)
         entries.push_back("Rad: " + String(m.radiation, 2) + " µR/h");
 
-    // === Show first available metric on top-right of first line ===
-    if (!entries.empty()) {
-        String valueStr = entries.front();
-        int rightX = SCREEN_WIDTH - display->getStringWidth(valueStr);
-        display->drawString(rightX, currentY, valueStr);
-        entries.erase(entries.begin()); // Remove from queue
-    }
-
-    // === Advance to next line for remaining telemetry entries ===
-    currentY += rowHeight;
-
-    // === Draw remaining entries in 2-column format (left and right) ===
+    display->setFont(FONT_SMALL);
+    display->setColor(WHITE);
+    display->setTextAlignment(TEXT_ALIGN_LEFT);
     for (size_t i = 0; i < entries.size(); i += 2) {
-        // Left column
-        display->drawString(x, currentY, entries[i]);
-
-        // Right column if it exists
-        if (i + 1 < entries.size()) {
-            int rightX = SCREEN_WIDTH / 2;
-            display->drawString(rightX, currentY, entries[i + 1]);
-        }
-
+        display->drawString(x + 8, currentY, entries[i]);
+        if (i + 1 < entries.size())
+            display->drawString(cx, currentY, entries[i + 1]);
         currentY += rowHeight;
     }
+
+    // === Source + age line ===
+    display->setFont(FONT_SMALL);
+    display->setColor(WHITE);
+    display->setTextAlignment(TEXT_ALIGN_LEFT);
+    display->drawString(x + 8, currentY, sender);
+    if (whenStr.length()) {
+        display->setTextAlignment(TEXT_ALIGN_RIGHT);
+        display->drawString(w - 8, currentY, whenStr);
+        display->setTextAlignment(TEXT_ALIGN_LEFT);
+    }
+
     graphics::drawCommonFooter(display, x, y);
 }
 #endif
