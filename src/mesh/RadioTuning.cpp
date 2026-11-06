@@ -13,7 +13,10 @@ constexpr const char *kNamespace = "radiotune";
 
 bool loaded = false;
 uint32_t tcxoUs = TCXO_STARTUP_DELAY_US;
-AgcMode agc = AgcMode::WhenIdle;
+// Default to the once-a-day forced reset only. The when-idle reset (#12072) can re-run a full
+// CALIBRATE_ALL mid-traffic on a quiet channel, which briefly drops RX; daily-only keeps the gain
+// stable and is what these E22 field nodes want.
+AgcMode agc = AgcMode::DailyOnly;
 bool continuous = false;
 
 // Read once, on first use. A missing namespace (never saved) leaves the build defaults.
@@ -26,8 +29,8 @@ void load()
     if (!prefs.begin(kNamespace, true))
         return;
     tcxoUs = prefs.getUInt("tcxo", TCXO_STARTUP_DELAY_US);
-    const uint8_t a = prefs.getUChar("agc", (uint8_t)AgcMode::WhenIdle);
-    agc = a <= (uint8_t)AgcMode::DailyOnly ? (AgcMode)a : AgcMode::WhenIdle;
+    const uint8_t a = prefs.getUChar("agc", (uint8_t)AgcMode::DailyOnly);
+    agc = a <= (uint8_t)AgcMode::DailyOnly ? (AgcMode)a : AgcMode::DailyOnly;
     continuous = prefs.getBool("rxc", false);
     prefs.end();
 }

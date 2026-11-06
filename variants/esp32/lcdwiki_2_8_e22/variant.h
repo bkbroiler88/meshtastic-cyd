@@ -301,9 +301,10 @@
 #define SPECTRUM_ANALYZER
 // Home long-press > Quick Settings, System > Settings (names on the colour keyboard)
 #define LCDWIKI_EXTRAS
-// Default 5 ms, RadioLib's own value and what 2.8.0 ran with. Upstream's 1 ms (#12018) is tuned on
-// other boards; the E22's DIO3 TCXO may need longer when the chip wakes from duty-cycle sleep.
-#define TCXO_STARTUP_DELAY_US 5000
+// Default 10 ms. Upstream's 1 ms (#12018) is tuned on other boards; the E22's DIO3 TCXO wants
+// longer to settle when the chip wakes from duty-cycle sleep (10 ms gives margin against the
+// XOSC_START_ERR / -705 standby faults seen on this module). RadioLib's own value is 5 ms.
+#define TCXO_STARTUP_DELAY_US 10000
 
 // TX power is NOT set here. The E22-900M30S has a 10 dB external PA and a 30 dBm
 // rated output, so platformio.ini defines EBYTE_E22_900M30S and configuration.h:138
