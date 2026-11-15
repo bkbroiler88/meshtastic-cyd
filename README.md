@@ -92,6 +92,11 @@ Three of these matter more than they look:
 Full pinout, including display and touch, is in the
 [variant README](../../blob/lcdwiki-2.8-e22/variants/esp32/lcdwiki_2_8_e22/README.md).
 
+A fully illustrated install guide for the **BK Broiler Mesh V1** add-on board —
+with board drawings, CN2 jack-by-jack wiring, and both the **2.8″** and the
+**plug-and-play 3.5″ (E32R35T)** CYD — is in
+[docs/BKBroiler-Mesh-V1-CYD-Install-Guide.docx](docs/BKBroiler-Mesh-V1-CYD-Install-Guide.docx).
+
 ## Piglet (XIAO ESP32-S3 DIY)
 
 A Piglet wardriver turned into a Meshtastic node, with a pet pig on his own
